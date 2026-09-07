@@ -7,10 +7,11 @@ On-chain, daily counterpart of the Monthly Settlement Cycle (`../settlement-cycl
   (derived from `sUSDS.ssr()` at daily compounding) and the agent rate; `poke`
   marks positions through pricing adapters with index-based PnL routed by tag;
   `settle` executes the MSC identity in whole USDS: draws the Sky share as new
-  ilk debt through the AllocatorVault, pays the prime share to the SubProxy,
-  and joins Sky's net to the surplus buffer. No Vat privileges.
+  ilk debt through the AllocatorVault within the debt ceiling, pays the prime
+  share to the SubProxy, and joins Sky's net to the surplus buffer. No Vat
+  privileges.
 - `src/Pips.sol` — adapters: raw stablecoin, ERC-4626, ERC-7540, Aave/SparkLend aToken, relayed.
-- `test/Tally.t.sol` — 20 tests against mocks.
+- `test/Tally.t.sol` — 27 tests against mocks.
 
 ```shell
 forge build

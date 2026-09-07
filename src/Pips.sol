@@ -29,11 +29,16 @@ interface VaultLike is TokenLike {
     function convertToAssets(uint256 shares) external view returns (uint256);
 }
 
-interface AsyncVaultLike is VaultLike {
+// ERC-7540 async vault. Per ERC-7575 the share is a separate token
+// (`share()`); the vault itself has no ERC-20 surface.
+interface AsyncVaultLike {
+    function asset() external view returns (address);
+    function share() external view returns (address);
+    function convertToAssets(uint256 shares) external view returns (uint256);
     function pendingDepositRequest(uint256 requestId, address controller) external view returns (uint256 assets);
-    function claimableDepositRequest(uint256 requestId, address controller) external view returns (uint256 assets);
     function pendingRedeemRequest(uint256 requestId, address controller) external view returns (uint256 shares);
-    function claimableRedeemRequest(uint256 requestId, address controller) external view returns (uint256 shares);
+    function maxMint(address controller) external view returns (uint256 shares);      // fulfilled deposits, shares claimable
+    function maxWithdraw(address controller) external view returns (uint256 assets);  // fulfilled redeems, assets claimable
 }
 
 interface ATokenLike is TokenLike {
@@ -101,17 +106,30 @@ contract Erc4626Pip is Pip {
     }
 }
 
-/// ERC-7540 (Centrifuge JAAA / JTRSY...). Shares moved to escrow by
-/// `requestRedeem` are still the holder's; assets queued by `requestDeposit`
-/// are the holder's cash at par until shares are minted. Request id 0.
-contract Erc7540Pip is Erc4626Pip {
-    constructor(address vault_) Erc4626Pip(vault_) {}
+/// ERC-7540 (Centrifuge JAAA / JTRSY...). Four in-flight states, each at
+/// the price it actually has:
+///   pending redeem     shares in escrow, still floating       -> pie
+///   claimable redeem   fulfilled at a fixed price: assets     -> own (maxWithdraw)
+///   pending deposit    assets in escrow, at par                -> own
+///   claimable deposit  fulfilled: shares already minted        -> pie (maxMint)
+/// Request id 0. Balances and decimals come from the ERC-7575 share token.
+contract Erc7540Pip is Pip {
+    AsyncVaultLike public immutable vault;
+    TokenLike      public immutable share;
+    uint8          public immutable sdec;  // share decimals
+    uint8          public immutable adec;  // asset decimals
+
+    constructor(address vault_) {
+        vault = AsyncVaultLike(vault_);
+        share = TokenLike(vault.share());
+        sdec  = share.decimals();
+        adec  = TokenLike(vault.asset()).decimals();
+    }
 
     function peek(address who) external view override returns (uint256 pie, uint256 chi, uint256 own) {
-        AsyncVaultLike v = AsyncVaultLike(address(vault));
-        pie = _wad(v.balanceOf(who) + v.pendingRedeemRequest(0, who) + v.claimableRedeemRequest(0, who), sdec);
-        chi = _chi();
-        own = _wad(v.pendingDepositRequest(0, who) + v.claimableDepositRequest(0, who), adec);
+        pie = _wad(share.balanceOf(who) + vault.pendingRedeemRequest(0, who) + vault.maxMint(who), sdec);
+        chi = _wad(vault.convertToAssets(10 ** sdec), adec) * RAY / WAD;
+        own = _wad(vault.pendingDepositRequest(0, who) + vault.maxWithdraw(who), adec);
     }
 }
 

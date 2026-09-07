@@ -37,7 +37,7 @@ they cannot.
 | agent rate | SubProxy USDS × (SSR+20bps), sUSDS × 20bps, cost-basis principal | `drip`: same rates, sUSDS at current `convertToAssets` **[D]** |
 | distribution rewards | external xlsx | `gift(ilk, wad)` by an authorised hybrid process |
 | idle balances on L2s | deducted from utilized | relayed gems tagged `IDL`, Base Rate rebated on-chain; or `gift` **[D: hybrid]** |
-| mint | `vat.grab` + `vat.suck` in a spell | `AllocatorVault.draw(mint)` → `AllocatorBuffer.withdraw` **[D]** |
+| mint | `vat.grab` + `vat.suck` in a spell | `AllocatorVault.draw(mint)`, pulled from the AllocatorBuffer by allowance, capped by ceiling headroom **[D]** |
 | send | USDS transfer from surplus buffer | paid out of the mint, shortfall from `Tally`'s own USDS; net `mint − send` joined to the Vow |
 | whole USDS | `round()` per prime | floor to whole USDS, fractions carried **[D]** |
 | negative Sky share | not addressed | carried forward in `sde` **[D]** |
@@ -66,7 +66,7 @@ Facts from the off-chain pipeline that shaped the design:
                  │         SubProxy USDS/sUSDS × (SSR+tip) → owe │──► sUSDS.ssr(), balances
                  │  poke   Σ pip.peek(who) → gain / sde / rebate │──► Pips ──► vaults, aTokens
                  │  settle sky, sv, mint, send (whole USDS)      │
-                 │         vault.draw(mint); buffer.withdraw     │──► AllocatorVault, AllocatorBuffer
+                 │         vault.draw(min(mint, room)); transferFrom │──► AllocatorVault, AllocatorBuffer
                  │         usds.transfer(sub, send)              │
                  │         join(vow, mint − send)                │──► UsdsJoin
   governance     │  init / file / gift / rely / deny / cage      │
@@ -120,9 +120,20 @@ agentRate = usds_sub × (ssrps + tip/365d) × dt + susds_sub_value × tip/365d �
 fee       = min(debt, line) × cut/365d × dt + max(debt − line, 0) × duty × dt     (or debt × duty × dt if no subsidy)
 ```
 
-`file(ilk, "pad"|"tip"|"cut"|"line")` requires `rho == now`: drip in the same
-block so a rate change never applies retroactively. `duty` itself follows
-SP-BEAM changes to `ssr` with no governance action.
+`file(ilk, "pad"|"tip"|"cut"|"line")` requires a drip and a poke of every gem
+in the same block, so no open interval is re-priced retroactively. `duty`
+itself follows SP-BEAM changes to `ssr` with no governance action.
+
+**Sampling rule.** Balances are read at the two ends of an interval, not
+integrated, and the Vat has no hook into `Tally`. So every accrual is taken on
+the end that is worse for the prime: the larger of the two debt readings, the
+smaller of the two SubProxy readings, and for `SAV` / `IDL` gems the smaller
+of the two values. A prime that calls `drip` (or `poke`) in the same block
+before it draws, wipes or moves funds is charged and credited exactly. One
+that does not pays the interval at the higher debt. A same-block `drip`
+accrues nothing but refreshes the samples, so drip-then-move works. The ALM
+controller can be taught to call `drip` before `mintUSDS` / `burnUSDS`; until
+then the rule makes mistiming cost the prime, never Sky.
 
 ### 2.3 Positions
 
@@ -132,9 +143,9 @@ SP-BEAM changes to `ssr` with no governance action.
 | tag | routing |
 |---|---|
 | `MTM` | `gain += dpnl` |
-| `SDE` | `share = cap == 0 ? 1 : min(1, cap / value)`; `sde += dpnl × share`; `gain += rest` |
-| `SAV` | `rebate += value × pad/365d × dt`; `dpnl` ignored (SSR stays in the token) |
-| `IDL` | `rebate += value × duty × dt`: the Base Rate charged on non-utilized balances is handed back. Exact while idle ≤ debt − line |
+| `SDE` | `share = cap == 0 ? 1 : min(1, cap / prior value)`; `sde += dpnl × share`; `gain += rest`. The share is taken on the value the move was measured on, so a crash or a full redemption never routes more than Sky's slice |
+| `SAV` | `rebate += min(value, prior value) × pad/365d × dt`; `dpnl` ignored (SSR stays in the token) |
+| `IDL` | `rebate += min(value, prior value) × marginal × dt`, where `marginal` is `cut` inside the subsidy cap and the full Base Rate above it. At settle the total rebate is bounded by `tab`: never more is handed back than was charged |
 | `NIL` | nothing booked (Savings V2 position-only) |
 
 Adapters shipped in `src/Pips.sol`:
@@ -143,9 +154,15 @@ Adapters shipped in `src/Pips.sol`:
 |---|---|---|---|
 | `RawPip` | `balanceOf` | `RAY` | 0 |
 | `Erc4626Pip` | `balanceOf` | `convertToAssets(1 share)` | 0 |
-| `Erc7540Pip` | `balanceOf + pendingRedeem + claimableRedeem` | same | `pendingDeposit + claimableDeposit` |
+| `Erc7540Pip` | `share.balanceOf + pendingRedeem + maxMint` | same | `pendingDeposit + maxWithdraw` |
 | `ATokenPip` | `scaledBalanceOf` | `pool.getReserveNormalizedIncome(asset)` | 0 |
 | `RelayPip` | pushed by an authorised writer | pushed | pushed |
+
+`Erc7540Pip` follows ERC-7575: the vault has no ERC-20 surface, balances and
+decimals come from `vault.share()`. Its four in-flight states are each priced
+at the price they actually have: pending redeems float with the index, fulfilled
+redeems are fixed assets (`maxWithdraw`), pending deposits are assets at par,
+fulfilled deposits are shares already minted (`maxMint`).
 
 `RelayPip` reverts on a mark older than `hop` (default one day, OSM-style), so a
 stale relay stops `settle` for the whole ilk rather than settling on old data.
@@ -160,34 +177,50 @@ would be further pips; nothing in `Tally` changes.
 `settle(ilk)` is permissionless. It drips, pokes every gem, then:
 
 ```
-sky   = tab + sde − rebate
-sv    = gain + rebate − tab − sin_prev
-mint  = floor(sky + max(sv, 0))   fraction (or a negative total) carried in `sde`
-send  = floor(owe + sv)           fraction carried in `owe`; a negative total in `sin`
+rebate = min(rebate, tab)          never hand back more than was charged
+sky    = tab + sde − rebate
+sv     = gain + rebate − tab − sin_prev
+up     = max(sv, 0)
+mint   = floor(sky + up)           fraction, a negative total, and anything the
+                                   ceiling blocks carry in `sde`
+send   = floor(owe + up)           fraction carries in `owe`
+sin    = max(−sv, 0)               a supply loss waits for supply gains only
 
-vault.draw(mint)                  new ilk debt, USDS lands in the AllocatorBuffer
-buffer.withdraw(usds, this, mint)
-usds.transfer(sub, min(send, balance))     shortfall beyond the mint comes from
-                                           USDS governance parked here; unpaid → owe
-join(vow, mint − send)            Sky's net, credited to the surplus buffer
+drew = min(mint, room)             room = ilk and global ceiling headroom, less 1 USDS
+vault.draw(drew); usds.transferFrom(buffer, this, drew)
+usds.transfer(sub, min(send, balance))     shortfall beyond the draw comes from
+                                           USDS governance parks here; unpaid → owe
+join(vow, drew − send)             Sky's net, credited to the surplus buffer
 ```
 
-This nets the two MSC legs: instead of minting to the surplus buffer and
-paying the SubProxy out of it, the prime's fresh debt pays the SubProxy
-directly and only Sky's net crosses into the Vow. Economically identical,
-and it needs no Vat privilege. When `send > mint` (Keel, Skybase, any prime
-whose demand side exceeds its Sky share) Sky's part of the payment comes from
-USDS that governance leaves in the contract, the on-chain equivalent of the
-Demand-Side Buffer transfer in today's settlement transaction. If that runs
-dry the balance is owed, not lost.
+This nets the two MSC legs: the prime's fresh debt pays the SubProxy directly
+and only Sky's net crosses into the Vow. When `send` exceeds the draw (Keel,
+Skybase, any prime whose demand side exceeds its Sky share) Sky's part comes
+from the pre-funded float, the on-chain form of the Demand-Side Buffer
+transfer in today's settlement transaction. If the float runs dry the balance
+is owed, not lost. `quit` lets governance move the float, or anything else,
+out at any time, including after `cage`.
 
-Because settlement executes in one transaction there is no `tab` to wipe;
-the earlier `wipe` function is gone.
+**Departure from the monthly identity.** The MSC nets a negative supply share
+inside the send (`send = dv + sv`). Done daily that is path-dependent: a loss
+day eats the agent rate, and the recovery day mints the prime new debt to pay
+itself back. `Tally` instead carries the loss in `sin` and pays the demand
+side regardless. Over any window the totals match a single monthly netting
+only when the supply share ends positive; when it ends negative the prime
+keeps its demand side and Sky keeps the loss on the books until supply gains
+absorb it.
+
+**Debt ceiling.** `room(ilk)` reads the ilk `line` and the global `Line`. The
+draw is capped at whatever headroom exists and the remainder carries on the
+Sky side, so a prime at its AutoLine cap still gets its demand side paid and
+Sky's charge keeps accruing instead of the whole cycle reverting.
 
 ### 2.5 Permissions
 
 `Tally` needs the prime-scoped roles the ALM controller already holds:
-`AllocatorVault.draw` and `AllocatorBuffer.withdraw` for its own ilk. It
+`AllocatorVault.draw` for its ilk and a USDS allowance from the
+AllocatorBuffer (`buffer.approve(usds, tally, max)`; the audited buffer has
+no `withdraw`, only `approve`). It
 holds no Vat authority. Governance holds `Tally.wards` for `init`, `file`,
 `gift`, `cage`, and tops up the USDS float for demand-side payments. The
 hybrid process needs `gift` and `RelayPip.poke` only. `drip`, `poke`,
@@ -244,12 +277,15 @@ made per chain and upgraded later without touching `Tally`.
 
 - `src/Tally.sol`: the contract above.
 - `src/Pips.sol`: the five adapters.
-- `test/Tally.t.sol`: 20 tests against mocks of Vat, AllocatorVault,
+- `test/Tally.t.sol`: 27 tests against mocks of Vat, AllocatorVault,
   AllocatorBuffer, UsdsJoin, sUSDS, ERC-4626/7540 vaults and an aToken pool,
   covering rates, index PnL, haircuts, escrow, SDE caps, SAV and IDL rebates,
   subsidy, whole-USDS settlement with carries, the negative prime share, the
-  hoard-funded demand side, gifts, permissionless settle, the
-  allocator-only privilege boundary and relay staleness.
+  float-funded demand side, gifts, permissionless settle, the
+  allocator-only privilege boundary, relay staleness, debt-ceiling carries,
+  the sampling rule, the four ERC-7540 in-flight states, cap-on-prior-value
+  SDE shares, gem re-basing, and `quit` after `cage`. The mocks match the real
+  AllocatorBuffer (approve only) and the ERC-7575 share layout.
 
 ## 5. Decisions log
 
@@ -266,5 +302,15 @@ carried in `owe`); **operator relay** for L2 balances now, via
 sources plug into the same `RelayPip` by being `rely`'d on it; nothing in
 `Tally` changes.
 
+2026-09-07, code review: settle pulls from the buffer with `transferFrom`
+(the real buffer has no `withdraw`); draws are capped by ceiling headroom and
+the rest carried; accruals sample the balance worse for the prime; IDL rebate
+at the marginal rate and bounded by `tab`; SDE share on prior value; every gem
+re-file requires a same-block poke and re-seeds; rate re-files require every
+gem poked; a supply loss never nets against the demand side; `quit` added;
+ERC-7540 adapter reads the ERC-7575 share and prices claimable legs at their
+fixed values; `cut == 0` no longer disables the subsidy (`line` is the switch).
+
 Open: contract name (`Tally` stands; `Till` is the short alternative); float
-sizing and top-up cadence.
+sizing and top-up cadence; teaching the ALM controller to `drip` before
+`mintUSDS` / `burnUSDS`.
