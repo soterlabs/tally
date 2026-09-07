@@ -3,15 +3,16 @@
 On-chain, daily counterpart of the Monthly Settlement Cycle (`../settlement-cycle`).
 
 - `DESIGN.md` — MSC ↔ DSC mapping, architecture, vocabulary, rates, settlement, hybrid boundary, open items.
-- `src/Tally.sol` — one instance per allocator ilk. `drip` accrues the Base Rate
-  (derived from `sUSDS.ssr()` at daily compounding) and the agent rate; `poke`
+- `src/Tally.sol` — one instance per allocator ilk, `alm` / `sub` / `vault` / `buffer`
+  filed by governance. `drip` accrues the Base Rate off the sUSDS share-price index
+  plus a spread, the agent rate, and the sUSDS-spread / idle rebates; `poke`
   marks positions through pricing adapters with index-based PnL routed by tag;
   `settle` executes the MSC identity in whole USDS: draws the Sky share as new
   ilk debt through the AllocatorVault within the debt ceiling, pays the prime
   share to the SubProxy, and joins Sky's net to the surplus buffer. No Vat
   privileges.
 - `src/Pips.sol` — adapters: raw stablecoin, ERC-4626, ERC-7540, Aave/SparkLend aToken, relayed.
-- `test/Tally.t.sol` — 27 tests against mocks.
+- `test/Tally.t.sol` — 28 tests against mocks.
 - `test/Obex.fork.t.sol` — mainnet fork backtest: Obex, August 2026, versus `settlement-cycle` (see `DESIGN.md` §5).
 
 ```shell

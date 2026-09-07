@@ -25,7 +25,7 @@ they cannot.
 | MSC term | Off-chain source today | DSC |
 |---|---|---|
 | `cum_debt` | `Vat.ilks(ilk).Art × rate` at EoD block | `debt(ilk)`, same read **[D]** |
-| Base Rate | `SSR_apr(n=12) + spread`, spread from config | `duty(ilk) = ssrps() + pad/365d`, `ssrps` from `sUSDS.ssr()` at `n = 365` **[D]** |
+| Base Rate | `SSR_apr(n=12) + spread`, spread from config | `dchi + pad × dt/365d`, where `dchi` is the growth of the sUSDS share price over the interval **[D]** |
 | subsidy | SOFR ramp on first $1B | `cut` (rate) and `line` (cap), filed by governance **[D]** |
 | utilized deductions | idle USDS, PSM3 legs, lending-idle | **not on-chain**: most idle sits on other chains; deducted in the hybrid layer **[D]** |
 | `value_som/eom`, `period_inflow` | balance × unit price at pin blocks, Transfer-event flows | `poke`: index PnL `pie × Δchi`, flows fall out |
@@ -48,8 +48,12 @@ Facts from the off-chain pipeline that shaped the design:
   monthly by `grab`. `Tally.drip` is the missing Jug.
 - BR is a nominal APR (Rule 1, 2026-09-01). Accrual is linear between
   settles; compounding happens only through capitalisation, which DSC does
-  daily. Hence the APY→APR conversion at `n = 365`, and hence `ssrps()`:
-  `rpow(ssr, 86400) − RAY` is exactly one day's slice of the SSR APY.
+  daily. Hence the APY→APR conversion at `n = 365`. On-chain the cleanest
+  form is the sUSDS share price itself: its growth between two drips is the
+  SSR compounded per second over exactly that interval, every SP-BEAM change
+  included. Over one day that equals the `n = 365` slice; over a longer gap
+  it is what Sky actually paid on sUSDS, which is what Rule 1's neutrality
+  argument wants.
 - The 0.66 bps/yr settlement-lag residual the PRD attributes to monthly
   cadence (`PRD.md:1332`) disappears by construction.
 - Grove's E9 phantom loss (−$22.5M, escrowed JTRSY shares) is why the 7540
@@ -62,8 +66,8 @@ Facts from the off-chain pipeline that shaped the design:
                  ┌──────────────────────────────────────────────┐
   keeper (daily) │ Tally  (one instance per allocator ilk)       │
   ─ settle(ilk) ►│                                              │
-                 │  drip   debt×duty×dt → tab                    │──► Vat.ilks(ilk)
-                 │         SubProxy USDS/sUSDS × (SSR+tip) → owe │──► sUSDS.ssr(), balances
+                 │  drip   debt×(Δchi+pad·dt) → tab; rebates     │──► Vat.ilks(ilk)
+                 │         SubProxy USDS/sUSDS × (Δchi+tip) → owe │──► sUSDS.convertToAssets, balances
                  │  poke   Σ pip.peek(who) → gain / sde / rebate │──► Pips ──► vaults, aTokens
                  │  settle sky, sv, mint, send (whole USDS)      │
                  │         vault.draw(min(mint, room)); transferFrom │──► AllocatorVault, AllocatorBuffer
@@ -77,23 +81,29 @@ Facts from the off-chain pipeline that shaped the design:
 ```
 
 **Deployment [D]:** Ethereum only for now (the ilks live there). One `Tally`
-instance per allocator ilk: Spark, Bloom, Grove (Diamond PAU), Obex, Prysm.
-Keel and Skybase have no ilk and no ALM positions; a `Tally` with no gems and
-`debt = 0` still pays their agent rate through `drip` + `settle`.
+instance per allocator ilk, with `ilk` immutable and `alm`, `sub`, `vault`,
+`buffer` filed by governance: Spark, Bloom, Grove (Diamond PAU), Obex, Prysm.
+A prime with two ilks (Grove) deploys two instances sharing `sub` and sets
+`pay = 1` on exactly one, so the agent rate on the shared SubProxy is paid
+once. Keel and Skybase have no ilk and no ALM positions; an instance with no
+gems and `debt = 0` still pays their agent rate through `drip` + `settle`.
 
 ### 2.1 Vocabulary
 
 | Word | Meaning here | Precedent |
 |---|---|---|
-| `ilk` | an allocator ilk, i.e. a prime's debt compartment | Vat |
+| `ilk` | the allocator ilk this instance settles (immutable) | Vat |
 | `alm` | ALM Proxy, default holder of the gems | — |
-| `sub` | SubProxy: paid at settle, earns the agent rate | — |
+| `sub` | SubProxy: paid at settle, earns the agent rate when `pay = 1` | — |
+| `pay` | 1 if this ilk carries the prime's demand side (agent rate, gifts) | — |
 | `gem` | a token position (USDS, sUSDC, JTRSY, spUSDS…) | Vat / Join |
 | `pip` | pricing adapter for a gem, `peek(who) → (pie, chi, own)` | Spot / OSM |
 | `who` | holder override for a gem (0 = `alm`) | — |
 | `tag` | routing: `MTM`, `SDE`, `SAV`, `IDL`, `NIL` | — |
 | `vault` / `buffer` | the prime's AllocatorVault / AllocatorBuffer | dss-allocator |
-| `pie` / `chi` | shares held / price per 1e18 shares (ray) | Pot / sUSDS |
+| `pie` / `chi` | per gem: shares held / price per 1e18 shares (ray) | Pot / sUSDS |
+| `chi` (ilk) | sUSDS share price at last drip, the SSR index (wad) | Pot / sUSDS |
+| `art` / `usd` / `sus` | ilk debt, SubProxy USDS, SubProxy sUSDS value at last drip | Vat `art` |
 | `own` | assets owned outside the shares (7540 deposit queue) | — |
 | `fee` | redemption haircut on vault value (wad) | — |
 | `cap` | SDE: Sky's capped slice (wad), 0 = whole | — |
@@ -114,15 +124,18 @@ Keel and Skybase have no ilk and no ALM positions; a `Tally` with no gems and
 All annual rates are **nominal** and applied as `rate / 365 days` per second.
 
 ```
-ssrps     = (rpow(sUSDS.ssr(), 86400) − RAY) / 86400      SSR, per-second nominal at daily compounding
-duty      = ssrps + pad / 365d                             Base Rate
-agentRate = usds_sub × (ssrps + tip/365d) × dt + susds_sub_value × tip/365d × dt
-fee       = min(debt, line) × cut/365d × dt + max(debt − line, 0) × duty × dt     (or debt × duty × dt if no subsidy)
+dchi      = sUSDS.convertToAssets(1e18) / chi_prev − 1     SSR over the interval, as sUSDS compounded it
+br        = dchi + pad × dt / 365d                         Base Rate over the interval
+fee       = max(debt_now, debt_prev) × br                  (subsidy: min(·, line) × cut × dt/365d + rest × br)
+agentRate = min(usds_now, usds_prev) × (dchi + tip × dt/365d) + min(susds_now, susds_prev) × tip × dt/365d
+rebates   = Σ SAV: min(val_now, val_prev) × pad × dt/365d ;  Σ IDL: min(val_now, val_prev) × marginal
 ```
 
-`file(ilk, "pad"|"tip"|"cut"|"line")` requires a drip and a poke of every gem
-in the same block, so no open interval is re-priced retroactively. `duty`
-itself follows SP-BEAM changes to `ssr` with no governance action.
+`file("pad"|"tip"|"cut"|"line"|"pay")` requires a drip and a poke of every
+gem in the same block, so no open interval is re-priced retroactively. The
+SSR leg needs no governance action at all: the sUSDS index already carries
+every SP-BEAM change, and a `drip` after a long gap prices each sub-period at
+the rate that was in force.
 
 **Sampling rule.** Balances are read at the two ends of an interval, not
 integrated, and the Vat has no hook into `Tally`. So every accrual is taken on
@@ -144,8 +157,8 @@ then the rule makes mistiming cost the prime, never Sky.
 |---|---|
 | `MTM` | `gain += dpnl` |
 | `SDE` | `share = cap == 0 ? 1 : min(1, cap / prior value)`; `sde += dpnl × share`; `gain += rest`. The share is taken on the value the move was measured on, so a crash or a full redemption never routes more than Sky's slice |
-| `SAV` | `rebate += min(value, prior value) × pad/365d × dt`; `dpnl` ignored (SSR stays in the token) |
-| `IDL` | `rebate += min(value, prior value) × marginal × dt`, where `marginal` is `cut` inside the subsidy cap and the full Base Rate above it. At settle the total rebate is bounded by `tab`: never more is handed back than was charged |
+| `SAV` | no PnL (SSR stays in the token); `drip` rebates `min(value, prior value) × pad × dt/365d` |
+| `IDL` | no PnL; `drip` rebates `min(value, prior value) × marginal`, where `marginal` is `cut` inside the subsidy cap and the full Base Rate above it. At settle the total rebate is bounded by `tab`: never more is handed back than was charged |
 | `NIL` | nothing booked (Savings V2 position-only) |
 
 Adapters shipped in `src/Pips.sol`:
@@ -174,7 +187,7 @@ would be further pips; nothing in `Tally` changes.
 
 ### 2.4 Settlement
 
-`settle(ilk)` is permissionless. It drips, pokes every gem, then:
+`settle()` is permissionless. It drips, pokes every gem, then:
 
 ```
 rebate = min(rebate, tab)          never hand back more than was charged
@@ -277,7 +290,7 @@ made per chain and upgraded later without touching `Tally`.
 
 - `src/Tally.sol`: the contract above.
 - `src/Pips.sol`: the five adapters.
-- `test/Tally.t.sol`: 27 tests against mocks of Vat, AllocatorVault,
+- `test/Tally.t.sol`: 28 tests against mocks of Vat, AllocatorVault,
   AllocatorBuffer, UsdsJoin, sUSDS, ERC-4626/7540 vaults and an aToken pool,
   covering rates, index PnL, haircuts, escrow, SDE caps, SAV and IDL rebates,
   subsidy, whole-USDS settlement with carries, the negative prime share, the
@@ -350,6 +363,13 @@ gem poked; a supply loss never nets against the demand side; `quit` added;
 ERC-7540 adapter reads the ERC-7575 share and prices claimable legs at their
 fixed values; `cut == 0` no longer disables the subsidy (`line` is the switch).
 
+2026-09-07, later: the SSR leg reads the sUSDS share price (index) instead
+of the spot `ssr()`, so SP-BEAM changes inside an interval are priced
+exactly and a long gap compounds as sUSDS does; one instance per ilk with
+`ilk` immutable and `alm` / `sub` / `vault` / `buffer` filed; `pay` flag so
+a prime with two ilks pays the agent rate once; rebates accrue in `drip` on
+the drip interval. Obex backtest unchanged on the daily cadence.
+
 Open: contract name (`Tally` stands; `Till` is the short alternative); float
 sizing and top-up cadence; teaching the ALM controller to `drip` before
-`mintUSDS` / `burnUSDS`.
+`mintUSDS` / `burnUSDS`; a `TallyJob` for the keeper network.
