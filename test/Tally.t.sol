@@ -51,10 +51,38 @@ contract MockAsyncVault {
     function maxWithdraw(address) external view returns (uint256) { return maxW; }
 }
 
-// sUSDS: a vault with a per-second savings rate.
-contract MockSusds is MockVault {
-    uint256 public ssr;
-    constructor(address usds, uint256 ssr_, uint256 pps_) MockVault(usds, 18, pps_) { ssr = ssr_; }
+// sUSDS: share price compounds per second at `ssr`, like the real one.
+contract MockSusds is MockToken {
+    uint256 constant RAY = 1e27;
+    address public asset;
+    uint256 public ssr; uint256 public chi; uint256 public rho;
+    constructor(address usds, uint256 ssr_, uint256 chi_) MockToken(18) { asset = usds; ssr = ssr_; chi = chi_; rho = block.timestamp; }
+    function _rpow(uint256 x, uint256 n, uint256 b) internal pure returns (uint256 z) {
+        assembly {
+            switch x case 0 {switch n case 0 {z := b} default {z := 0}}
+            default {
+                switch mod(n, 2) case 0 { z := b } default { z := x }
+                let half := div(b, 2)
+                for { n := div(n, 2) } n { n := div(n,2) } {
+                    let xx := mul(x, x)
+                    if iszero(eq(div(xx, x), x)) { revert(0,0) }
+                    let xxRound := add(xx, half)
+                    if lt(xxRound, xx) { revert(0,0) }
+                    x := div(xxRound, b)
+                    if mod(n,2) {
+                        let zx := mul(z, x)
+                        if and(iszero(iszero(x)), iszero(eq(div(zx, x), z))) { revert(0,0) }
+                        let zxRound := add(zx, half)
+                        if lt(zxRound, zx) { revert(0,0) }
+                        z := div(zxRound, b)
+                    }
+                }
+            }
+        }
+    }
+    function nowChi() public view returns (uint256) { return chi * _rpow(ssr, block.timestamp - rho, RAY) / RAY; }
+    function convertToAssets(uint256 shares) external view returns (uint256) { return shares * nowChi() / 1e18; }
+    function file(uint256 ssr_) external { chi = nowChi(); rho = block.timestamp; ssr = ssr_; }   // SP-BEAM: drip then set
 }
 
 // aToken + pool with a settable liquidity index.
@@ -81,7 +109,6 @@ contract MockVat {
         Art[ilk] = Art_; rate[ilk] = rate_; line[ilk] = type(uint256).max / 2;
     }
     function setLine(bytes32 ilk, uint256 rad) external { line[ilk] = rad; }
-    function setLineGlobal(uint256 rad) external { Line = rad; }
     function ilks(bytes32 ilk) external view returns (uint256, uint256, uint256, uint256, uint256) {
         return (Art[ilk], rate[ilk], 0, line[ilk], 0);
     }
@@ -133,10 +160,8 @@ contract TallyTest is Test {
     uint256 constant RAY = 1e27;
     // sUSDS per-second rate for a 3.52% APY: 1.0352^(1/31536000)
     uint256 constant SSR = 1000000001096988989836188434;
-    // (1.0352)^(1/365) - 1
-    uint256 constant DAY_SLICE = 0.00009478434042e27;
-    // one day of Base Rate at SSR + 20 bps, as a fraction of debt
-    // 9.478434e-5 + 0.002/365 = 1.0026384e-4
+    // one day of Base Rate at SSR + 20 bps, as a fraction of debt:
+    // (1.0352)^(1/365) - 1 + 0.002/365 = 9.478434e-5 + 5.4795e-6 = 1.0026384e-4
 
     address alm = address(0xA1);
     address sub = address(0x5B);
@@ -167,7 +192,8 @@ contract TallyTest is Test {
         join   = new MockJoin(address(usds));
         buffer = new MockBuffer();
         vault  = new MockAllocatorVault(address(vat), address(join), ILK, address(buffer));
-        tally  = new Tally(address(vat), vow, address(join), address(usds), address(susds));
+        vat.set(ILK, 0, RAY);
+        tally  = new Tally(ILK, address(vat), vow, address(join), address(usds), address(susds));
         vault.rely(address(tally));
         buffer.approve(address(usds), address(tally), type(uint256).max);
 
@@ -185,176 +211,147 @@ contract TallyTest is Test {
         spUsds.mint(alm, 300_000e18);
         susds.mint(alm, 400_000e18);
 
-        vat.set(ILK, 0, RAY);
-        tally.init(ILK, alm, sub);
-        tally.file(ILK, "vault",  address(vault));
-        tally.file(ILK, "buffer", address(buffer));
-        tally.file(ILK, "pad", 0.002e27);   // BR = SSR + 20 bps
-        tally.file(ILK, "tip", 0.002e27);   // agent rate = SSR + 20 bps
-        tally.init(ILK, address(usds),   address(new RawPip(address(usds))),      tally.MTM());
-        tally.init(ILK, address(usdc),   address(new RawPip(address(usdc))),      tally.MTM());
-        tally.init(ILK, address(sUsdc),  address(sUsdcPip),                       tally.MTM());
-        tally.init(ILK, address(jtrsy),  address(new Erc7540Pip(address(jtrsy))), tally.SDE());
-        tally.init(ILK, address(spUsds), address(new ATokenPip(address(spUsds))), tally.MTM());
-        tally.init(ILK, address(susds),  address(new Erc4626Pip(address(susds))), tally.SAV());
+        tally.file("alm",    alm);
+        tally.file("sub",    sub);
+        tally.file("vault",  address(vault));
+        tally.file("buffer", address(buffer));
+        tally.file("pad", 0.002e27);   // BR = SSR + 20 bps
+        tally.file("tip", 0.002e27);   // agent rate = SSR + 20 bps
+        tally.file("pay", 1);
+        tally.init(address(usds),   address(new RawPip(address(usds))),      tally.MTM());
+        tally.init(address(usdc),   address(new RawPip(address(usdc))),      tally.MTM());
+        tally.init(address(sUsdc),  address(sUsdcPip),                       tally.MTM());
+        tally.init(address(jtrsy),  address(new Erc7540Pip(address(jtrsy))), tally.SDE());
+        tally.init(address(spUsds), address(new ATokenPip(address(spUsds))), tally.MTM());
+        tally.init(address(susds),  address(new Erc4626Pip(address(susds))), tally.SAV());
     }
 
     // Set the ilk debt and sample it, as a prime that drips before drawing would.
-    function _debt(uint256 wad) internal { vat.set(ILK, wad, RAY); tally.drip(ILK); }
+    function _debt(uint256 wad) internal { vat.set(ILK, wad, RAY); tally.drip(); }
     // Fund the SubProxy and sample it.
-    function _fund(uint256 wad) internal { usds.mint(sub, wad); tally.drip(ILK); }
-
-    function _book() internal view returns (uint256 tab, uint256 owe, int256 gain, int256 sde, uint256 rebate, uint256 sin) {
-        (tab, owe, gain, sde, rebate, sin,,,) = tally.books(ILK);
-    }
+    function _fund(uint256 wad) internal { usds.mint(sub, wad); tally.drip(); }
 
     // --- pricing ---
 
     function test_nav() public view {
         // 1,000,000 + 500,000 + 105,000 + 200,000 + 300,000 + 420,000
-        assertEq(tally.nav(ILK), 2_525_000e18);
-    }
-
-    function test_ssr_daily_nominal_matches_apy_slice() public view {
-        uint256 day = tally.ssrps() * 1 days;
-        assertApproxEqRel(day, DAY_SLICE, 1e12);   // 1e-6 relative
-        assertEq(tally.duty(ILK), tally.ssrps() + uint256(0.002e27) / 365 days);
+        assertEq(tally.nav(), 2_525_000e18);
     }
 
     function test_poke_books_index_move_not_flows() public {
         usdc.mint(alm, 9_000_000e6);              // flow
-        tally.poke(ILK);
-        (,, int256 gain,,,) = _book();
-        assertEq(gain, 0);
+        tally.poke();
+        assertEq(tally.gain(), 0);
 
         sUsdc.setPps(1_060_000);                  // +1,000 on 100,000 shares
         pool.set(1.01e27);                        // +3,000 on 300,000 scaled
-        tally.poke(ILK);
-        (,, gain,,,) = _book();
-        assertEq(gain, 4_000e18);
+        tally.poke();
+        assertEq(tally.gain(), 4_000e18);
 
         sUsdc.setPps(1_000_000);                  // -6,000
-        tally.poke(ILK);
-        (,, gain,,,) = _book();
-        assertEq(gain, -2_000e18);
+        tally.poke();
+        assertEq(tally.gain(), -2_000e18);
     }
 
     function test_fee_haircut_is_not_booked_as_loss() public {
-        tally.poke(ILK, address(sUsdc));
-        tally.file(ILK, address(sUsdc), "fee", 0.01e18);
-        assertEq(tally.value(ILK, address(sUsdc)), 103_950e18);   // 105,000 * 0.99
-        tally.poke(ILK, address(sUsdc));
-        (,, int256 gain,,,) = _book();
-        assertEq(gain, 0);
+        tally.poke(address(sUsdc));
+        tally.file(address(sUsdc), "fee", 0.01e18);
+        assertEq(tally.value(address(sUsdc)), 103_950e18);   // 105,000 * 0.99
+        tally.poke(address(sUsdc));
+        assertEq(tally.gain(), 0);
     }
 
     function test_gem_refile_requires_poke_and_reseeds() public {
         vm.warp(block.timestamp + 1);
         vm.expectRevert("Tally/rho-not-updated");
-        tally.file(ILK, address(sUsdc), "pip", address(sUsdcPip));
+        tally.file(address(sUsdc), "pip", address(sUsdcPip));
 
         // Wrong adapter (par) corrected to the real one (1.05): no phantom PnL.
-        tally.poke(ILK, address(usdc));
-        tally.file(ILK, address(usdc), "pip", address(sUsdcPip));   // now priced at 1.05
-        tally.poke(ILK, address(usdc));
-        (,, int256 gain,,,) = _book();
-        assertEq(gain, 0);
-
-        // Tag change likewise re-bases: the open interval is not re-routed.
-        vm.warp(block.timestamp + 1 days);
-        tally.poke(ILK, address(usds));
-        tally.file(ILK, address(usds), "tag", tally.IDL());
-        (,,,, uint256 rebate,) = _book();
-        assertEq(rebate, 0);
+        tally.poke(address(usdc));
+        tally.file(address(usdc), "pip", address(sUsdcPip));
+        tally.poke(address(usdc));
+        assertEq(tally.gain(), 0);
     }
 
     function test_async_four_in_flight_states() public {
-        // 50,000 shares requested for redemption: 30,000 still pending (floating),
+        // 50,000 shares requested for redemption: 30,000 pending (floating),
         // 20,000 fulfilled at 1.00 -> 20,000 USDC claimable (fixed).
+        // 10,000 USDC requested for deposit: 6,000 pending (par), 4,000 fulfilled -> 4,000 shares.
         jtrsyShare.slash(alm, 50_000e6);
-        jtrsy.setQueues(30_000e6, 0, 0, 20_000e6);
-        // 10,000 USDC requested for deposit: 6,000 pending (par), 4,000 fulfilled -> 4,000 shares claimable.
         jtrsy.setQueues(30_000e6, 6_000e6, 4_000e6, 20_000e6);
         // pie = 150,000 + 30,000 + 4,000 = 184,000 ; own = 6,000 + 20,000
-        assertEq(tally.value(ILK, address(jtrsy)), 210_000e18);
-        tally.poke(ILK, address(jtrsy));
-        (,, int256 gain, int256 sde,,) = _book();
-        assertEq(gain, 0);
-        assertEq(sde, 0);
+        assertEq(tally.value(address(jtrsy)), 210_000e18);
+        tally.poke(address(jtrsy));
+        assertEq(tally.gain(), 0);
+        assertEq(tally.sde(), 0);
 
         // Index +1%: only floating shares move; the fixed claimable USDC does not.
         jtrsy.setPps(1_010_000);
-        tally.poke(ILK, address(jtrsy));
-        (,, gain, sde,,) = _book();
-        assertEq(sde, 1_840e18);
+        tally.poke(address(jtrsy));
+        assertEq(tally.sde(), 1_840e18);
     }
 
     function test_sde_cap_share_is_on_prior_value() public {
-        tally.file(ILK, address(jtrsy), "cap", 20_000e18);        // Sky's slice: 10% of 200,000
-        jtrsy.setPps(1_010_000);                                  // +2,000
-        tally.poke(ILK, address(jtrsy));
-        (,, int256 gain, int256 sde,,) = _book();
-        assertEq(sde, 200e18);
-        assertEq(gain, 1_800e18);
+        tally.file(address(jtrsy), "cap", 20_000e18);        // Sky's slice: 10% of 200,000
+        jtrsy.setPps(1_010_000);                             // +2,000
+        tally.poke(address(jtrsy));
+        assertEq(tally.sde(), 200e18);
+        assertEq(tally.gain(), 1_800e18);
 
         // Full redemption before the next poke plus another +1%: Sky still
         // takes only its slice of the move (20,000 / 202,000), not 100%.
         jtrsyShare.slash(alm, 200_000e6);
         jtrsy.setPps(1_020_000);
-        tally.poke(ILK, address(jtrsy));
-        (,, gain, sde,,) = _book();
-        assertApproxEqAbs(sde, 200e18 + 198.02e18, 0.01e18);
-        assertApproxEqAbs(gain, 1_800e18 + 1_801.98e18, 0.01e18);
+        tally.poke(address(jtrsy));
+        assertApproxEqAbs(tally.sde(), 200e18 + 198.02e18, 0.01e18);
+        assertApproxEqAbs(tally.gain(), 1_800e18 + 1_801.98e18, 0.01e18);
 
         // Crash on a fresh position: Sky's loss is bounded by its slice.
         jtrsyShare.mint(alm, 200_000e6);
-        tally.poke(ILK, address(jtrsy));                          // flow, no PnL
-        jtrsy.setPps(102_000);                                    // -90%
-        tally.poke(ILK, address(jtrsy));
-        (,, gain, sde,,) = _book();
+        tally.poke(address(jtrsy));                          // flow, no PnL
+        jtrsy.setPps(102_000);                               // -90%
+        tally.poke(address(jtrsy));
         // dpnl = 200,000 * (0.102 - 1.02) = -183,600 ; share = 20,000 / 204,000
-        assertApproxEqAbs(sde, 398.02e18 - 18_000e18, 0.01e18);
+        assertApproxEqAbs(tally.sde(), 398.02e18 - 18_000e18, 0.01e18);
     }
 
     function test_sav_rebates_spread_on_lower_balance_and_ignores_appreciation() public {
-        vm.warp(block.timestamp + 1 days);
-        susds.setPps(1.0501e18);                  // SSR accrual on the token
-        tally.poke(ILK, address(susds));
-        (,, int256 gain,, uint256 rebate,) = _book();
-        assertEq(gain, 0);
-        // min(420,040, 420,000) * 0.002 / 365 = 2.3014
-        assertApproxEqAbs(rebate, 2.3014e18, 1e15);
+        vm.warp(block.timestamp + 1 days);                   // sUSDS accrues a day of SSR
+        tally.drip();
+        tally.poke(address(susds));
+        assertEq(tally.gain(), 0);
+        // min(420,039.8, 420,000) * 0.002 / 365 = 2.3014
+        assertApproxEqAbs(tally.rebate(), 2.3014e18, 1e15);
     }
 
     function test_idl_rebate_bounded_by_tab() public {
         // 90M idle relayed, but the ilk has no debt: nothing was charged, nothing is rebated.
         RelayPip relay = new RelayPip();
         relay.poke(alm, 90_000_000e18, RAY, 0);
-        tally.init(ILK, address(0xBA5E), address(relay), tally.IDL());
+        tally.init(address(0xBA5E), address(relay), tally.IDL());
         usds.mint(address(tally), 5_000e18);      // float
         vm.warp(block.timestamp + 1 days);
         relay.poke(alm, 90_000_000e18, RAY, 0);
-        tally.settle(ILK);
+        tally.settle();
         assertEq(usds.balanceOf(address(tally)), 5_000e18);
         assertEq(usds.balanceOf(sub), 0);
     }
 
     function test_idl_rebate_at_subsidised_rate_inside_cap() public {
         _debt(500_000_000e18);
-        tally.poke(ILK);
-        tally.file(ILK, "cut", 0.03e27);
-        tally.file(ILK, "line", 1_000_000_000e18);
+        tally.poke();
+        tally.file("cut", 0.03e27);
+        tally.file("line", 1_000_000_000e18);
         RelayPip relay = new RelayPip();
         relay.poke(alm, 500_000_000e18, RAY, 0);
-        tally.init(ILK, address(0xBA5E), address(relay), tally.IDL());
+        tally.init(address(0xBA5E), address(relay), tally.IDL());
         vm.warp(block.timestamp + 1 days);
         relay.poke(alm, 500_000_000e18, RAY, 0);
-        tally.drip(ILK); tally.poke(ILK);
-        (uint256 tab,,,, uint256 rebate,) = _book();
+        tally.drip();
         // Everything idle and everything subsidised: idle rebate == charge,
         // 500M * 0.03 / 365; the extra 2.30 is the sUSDS spread rebate.
-        assertApproxEqRel(tab, 41_095.89e18, 1e13);
-        assertApproxEqAbs(rebate - tab, 2.3014e18, 1e15);
+        assertApproxEqRel(tally.tab(), 41_095.89e18, 1e13);
+        assertApproxEqAbs(tally.rebate() - tally.tab(), 2.3014e18, 1e15);
     }
 
     function test_relay_pip_stale_mark_blocks_settlement() public {
@@ -363,16 +360,16 @@ contract TallyTest is Test {
         relay.peek(alm);
 
         relay.poke(alm, 1_000e18, RAY, 0);
-        tally.init(ILK, address(0xCAFE), address(relay), tally.MTM());
+        tally.init(address(0xCAFE), address(relay), tally.MTM());
         _debt(1e18);
 
         vm.warp(block.timestamp + 1 days);
-        tally.settle(ILK);
+        tally.settle();
         vm.warp(block.timestamp + 1 days + 1);
         vm.expectRevert("RelayPip/stale");
-        tally.settle(ILK);
+        tally.settle();
         relay.file("hop", 3 days);
-        tally.settle(ILK);
+        tally.settle();
     }
 
     // --- drip ---
@@ -380,14 +377,26 @@ contract TallyTest is Test {
     function test_drip_charges_base_rate_and_agent_rate() public {
         _debt(1_000_000_000e18);
         _fund(30_000_000e18);
-        susds.mint(sub, 1_000_000e18); tally.drip(ILK);
+        susds.mint(sub, 1_000_000e18); tally.drip();
         vm.warp(block.timestamp + 1 days);
-        tally.drip(ILK);
-        (uint256 tab, uint256 owe,,,,) = _book();
+        tally.drip();
         // 1e9 * 1.0026384e-4 = 100,263.8
-        assertApproxEqRel(tab, 100_263.79e18, 1e13);
+        assertApproxEqRel(tally.tab(), 100_263.79e18, 1e13);
         // 30e6 * 1.0026384e-4 + 1.05e6 * 5.4795e-6 = 3,007.9 + 5.75 = 3,013.67
-        assertApproxEqRel(owe, 3_013.67e18, 1e13);
+        assertApproxEqRel(tally.owe(), 3_013.67e18, 1e13);
+    }
+
+    function test_drip_prices_ssr_change_inside_interval_exactly() public {
+        _debt(1_000_000_000e18);
+        tally.file("pad", 0);
+        // Ten days at 3.52%, then SP-BEAM cuts the SSR to zero for twenty days.
+        vm.warp(block.timestamp + 10 days);
+        susds.file(RAY);
+        vm.warp(block.timestamp + 20 days);
+        tally.drip();
+        // The sUSDS index grew (1.0352)^(10/365) - 1 = 9.48248e-4 over the whole
+        // gap: exactly ten days of SSR, none of the twenty at zero.
+        assertApproxEqRel(tally.tab(), 948_247.79e18, 1e12);
     }
 
     function test_drip_samples_worse_balance_for_prime() public {
@@ -399,52 +408,66 @@ contract TallyTest is Test {
         // still charged on 1e9, still credited on 10M only.
         vat.set(ILK, 700_000_000e18, RAY);
         usds.slash(sub, 20_000_000e18);
-        tally.drip(ILK);
-        (uint256 tab, uint256 owe,,,,) = _book();
+        tally.drip();
+        uint256 tab = tally.tab(); uint256 owe = tally.owe();
         assertApproxEqRel(tab, 100_263.79e18, 1e13);
-        assertApproxEqRel(owe, 10_000_000e18 * 100_263.79e18 / 1_000_000_000e18, 1e13);
+        assertApproxEqRel(owe, 1_002.64e18, 1e13);
 
         // Redraw and refund right after: next day is again charged on 1e9,
         // credited on 10M. The prime is never better off by timing.
         vat.set(ILK, 1_000_000_000e18, RAY);
         usds.mint(sub, 20_000_000e18);
         vm.warp(block.timestamp + 1 days);
-        tally.drip(ILK);
-        (uint256 tab2, uint256 owe2,,,,) = _book();
-        assertApproxEqRel(tab2 - tab, 100_263.79e18, 1e13);
-        assertApproxEqRel(owe2 - owe, 10_000_000e18 * 100_263.79e18 / 1_000_000_000e18, 1e13);
+        tally.drip();
+        assertApproxEqRel(tally.tab() - tab, 100_263.79e18, 1e13);
+        assertApproxEqRel(tally.owe() - owe, 1_002.64e18, 1e13);
+        tab = tally.tab();
 
         // A prime that drips before moving funds is charged exactly.
-        tally.drip(ILK);                         // same block: samples only
+        tally.drip();                            // same block: samples only
         vat.set(ILK, 700_000_000e18, RAY);
-        tally.drip(ILK);                         // re-sample post-wipe
+        tally.drip();                            // re-sample post-wipe
         vm.warp(block.timestamp + 1 days);
-        tally.drip(ILK);
-        (uint256 tab3,,,,,) = _book();
-        assertApproxEqRel(tab3 - tab2, 70_184.65e18, 1e13);
+        tally.drip();
+        assertApproxEqRel(tally.tab() - tab, 70_184.65e18, 1e13);
     }
 
     function test_drip_subsidy_first_line_at_cut() public {
         _debt(1_500_000_000e18);
-        tally.poke(ILK);
-        tally.file(ILK, "cut", 0.03e27);          // subsidised BR 3.00% nominal
-        tally.file(ILK, "line", 1_000_000_000e18);
+        tally.poke();
+        tally.file("cut", 0.03e27);               // subsidised BR 3.00% nominal
+        tally.file("line", 1_000_000_000e18);
         vm.warp(block.timestamp + 1 days);
-        tally.drip(ILK);
-        (uint256 tab,,,,,) = _book();
+        tally.drip();
         // 1e9 * 0.03/365 + 0.5e9 * 1.0026384e-4 = 82,191.8 + 50,131.9
-        assertApproxEqRel(tab, 132_323.68e18, 1e13);
+        assertApproxEqRel(tally.tab(), 132_323.68e18, 1e13);
+    }
+
+    function test_pay_flag_gates_demand_side() public {
+        // A second instance on another ilk of the same prime shares the
+        // SubProxy but does not carry the demand side.
+        Tally t2 = new Tally("ALLOCATOR-SPARK-B", address(vat), vow, address(join), address(usds), address(susds));
+        t2.file("sub", sub);
+        t2.file("tip", 0.002e27);
+        usds.mint(sub, 30_000_000e18);
+        t2.drip(); tally.drip();
+        vm.warp(block.timestamp + 1 days);
+        t2.drip(); tally.drip();
+        assertEq(t2.owe(), 0);
+        assertGt(tally.owe(), 0);
+        vm.expectRevert("Tally/not-paying");
+        t2.gift(1e18);
     }
 
     function test_file_rate_requires_fresh_drip_and_pokes() public {
         vm.warp(block.timestamp + 1);
         vm.expectRevert("Tally/rho-not-updated");
-        tally.file(ILK, "pad", 1);
-        tally.drip(ILK);
+        tally.file("pad", 1);
+        tally.drip();
         vm.expectRevert("Tally/gem-rho-not-updated");
-        tally.file(ILK, "pad", 1);
-        tally.poke(ILK);
-        tally.file(ILK, "pad", 1);
+        tally.file("pad", 1);
+        tally.poke();
+        tally.file("pad", 1);
     }
 
     // --- settle ---
@@ -457,7 +480,7 @@ contract TallyTest is Test {
         jtrsy.setPps(1_010_000);                  // +2,000 SDE to Sky
         uint256 debtBefore = vat.ilkDebt(ILK);
 
-        tally.settle(ILK);
+        tally.settle();
 
         // tab = 100,263.79  rebate = 2.30
         // sky = tab + 2,000 - rebate = 102,261.49 ; sv = 105,000 + rebate - tab = 4,738.51
@@ -466,11 +489,9 @@ contract TallyTest is Test {
         assertEq(usds.balanceOf(sub) - 30_000_000e18, 7_746e18);
         assertEq(join.credited(vow), (107_000e18 - 7_746e18) * RAY);
         assertEq(usds.balanceOf(address(tally)), 0);
-
-        (uint256 tab, uint256 owe, int256 gain, int256 sde, uint256 rebate, uint256 sin) = _book();
-        assertEq(tab, 0); assertEq(gain, 0); assertEq(rebate, 0); assertEq(sin, 0);
-        assertApproxEqAbs(owe, 0.42e18, 0.01e18);
-        assertGe(sde, 0); assertLt(sde, 1e18);
+        assertEq(tally.tab(), 0); assertEq(tally.gain(), 0); assertEq(tally.rebate(), 0); assertEq(tally.sin(), 0);
+        assertApproxEqAbs(tally.owe(), 0.42e18, 0.01e18);
+        assertGe(tally.sde(), 0); assertLt(tally.sde(), 1e18);
     }
 
     function test_settle_respects_debt_ceiling_and_carries_the_rest() public {
@@ -480,21 +501,18 @@ contract TallyTest is Test {
         vm.warp(block.timestamp + 1 days);
         sUsdc.setPps(2_100_000);
         jtrsy.setPps(1_010_000);
-        tally.settle(ILK);
+        tally.settle();
 
         // Wanted 107,000; room = 50,000 - 1 -> drew 49,999. Send is still paid in full.
         assertApproxEqAbs(vat.ilkDebt(ILK), 1_000_049_999e18, 1e9);
         assertEq(usds.balanceOf(sub) - 30_000_000e18, 7_746e18);
         assertEq(join.credited(vow), (49_999e18 - 7_746e18) * RAY);
-        (,,, int256 sde,,) = _book();
-        assertApproxEqAbs(sde, 57_001e18, 1e18);   // carried Sky share
+        assertApproxEqAbs(tally.sde(), 57_001e18, 1e18);   // carried Sky share
 
-        // Ceiling lifted: the carry is drawn next day on top of the day's charge.
         vat.setLine(ILK, type(uint256).max / 2);
         vm.warp(block.timestamp + 1 days);
-        tally.settle(ILK);
-        (,,, sde,,) = _book();
-        assertLt(sde, 1e18);
+        tally.settle();
+        assertLt(tally.sde(), 1e18);
     }
 
     function test_settle_at_ceiling_still_pays_demand_side_from_float() public {
@@ -503,52 +521,46 @@ contract TallyTest is Test {
         vat.setLine(ILK, 1_000_000_000e18 * RAY);   // no headroom at all
         usds.mint(address(tally), 5_000e18);
         vm.warp(block.timestamp + 1 days);
-        tally.settle(ILK);
+        tally.settle();
         assertEq(usds.balanceOf(sub) - 30_000_000e18, 3_007e18);   // dv 3,007.91 -> 3,007 (sv < 0, carried)
-        (,,, int256 sde,,) = _book();
-        assertApproxEqRel(sde, 100_261e18, 1e13);                   // Sky share waits for headroom
+        assertApproxEqRel(tally.sde(), 100_261e18, 1e13);            // Sky share waits for headroom
     }
 
     function test_settle_carries_negative_prime_share() public {
         _debt(1_000_000_000e18);
         vm.warp(block.timestamp + 1 days);
         sUsdc.setPps(500_000);                    // -55,000 loss on 100,000 shares
-        tally.settle(ILK);
-        (,,,,, uint256 sin) = _book();
+        tally.settle();
         // sv = -55,000 + 2.3 - 100,263.8 = -155,261.5 => carried
-        assertApproxEqRel(sin, 155_261.49e18, 1e13);
-        assertEq(join.credited(vow), 100_261e18 * RAY);   // Sky still drew floor(tab - rebate)
+        assertApproxEqRel(tally.sin(), 155_261.49e18, 1e13);
+        assertEq(join.credited(vow), 100_261e18 * RAY);
         assertEq(usds.balanceOf(sub), 0);
 
         vm.warp(block.timestamp + 1 days);
         sUsdc.setPps(4_050_000);                  // +355,000
-        tally.settle(ILK);
-        (,,,,, sin) = _book();
-        assertEq(sin, 0);
+        tally.settle();
+        assertEq(tally.sin(), 0);
         assertGt(usds.balanceOf(sub), 0);
     }
 
     function test_settle_never_nets_demand_side_against_supply_loss() public {
-        // Zero debt, only the demand side and a supply loss that reverses.
         usds.mint(address(tally), 1_000e18);
-        tally.poke(ILK);
-        tally.file(ILK, address(susds), "tag", tally.NIL());   // silence the sUSDS rebate
+        tally.poke();
+        tally.file(address(susds), "tag", tally.NIL());   // silence the sUSDS rebate
         vm.warp(block.timestamp + 1 days);
-        tally.gift(ILK, 30e18);
+        tally.gift(30e18);
         sUsdc.setPps(1_049_000);                  // -100
-        tally.settle(ILK);
-        (, uint256 owe,,,, uint256 sin) = _book();
-        assertEq(sin, 100e18);
-        assertEq(owe, 0);
+        tally.settle();
+        assertEq(tally.sin(), 100e18);
+        assertEq(tally.owe(), 0);
         assertEq(usds.balanceOf(sub), 30e18);     // demand side paid in full
 
         vm.warp(block.timestamp + 1 days);
-        tally.gift(ILK, 30e18);
+        tally.gift(30e18);
         sUsdc.setPps(1_050_000);                  // +100, exactly recovers
-        tally.settle(ILK);
-        (,,,,, sin) = _book();
-        assertEq(sin, 0);
-        assertEq(usds.balanceOf(sub), 60e18);     // mint stayed 0: the prime never borrowed its own agent rate
+        tally.settle();
+        assertEq(tally.sin(), 0);
+        assertEq(usds.balanceOf(sub), 60e18);     // the prime never borrowed its own agent rate
         assertEq(vat.ilkDebt(ILK), 0);
     }
 
@@ -556,7 +568,7 @@ contract TallyTest is Test {
         _fund(10_000_000e18);
         usds.mint(address(tally), 5_000e18);
         vm.warp(block.timestamp + 1 days);
-        tally.settle(ILK);
+        tally.settle();
         // dv = 10e6 * 1.0026384e-4 = 1,002.64 ; rebate bounded by tab = 0 ; send -> 1,002
         assertEq(usds.balanceOf(sub) - 10_000_000e18, 1_002e18);
         assertEq(usds.balanceOf(address(tally)), 3_998e18);
@@ -566,53 +578,52 @@ contract TallyTest is Test {
     function test_settle_carries_unpaid_send_when_float_is_empty() public {
         _fund(10_000_000e18);
         vm.warp(block.timestamp + 1 days);
-        tally.settle(ILK);
+        tally.settle();
         assertEq(usds.balanceOf(sub), 10_000_000e18);
-        (, uint256 owe,,,,) = _book();
-        assertApproxEqRel(owe, 1_002.64e18, 1e13);
+        assertApproxEqRel(tally.owe(), 1_002.64e18, 1e13);
         usds.mint(address(tally), 5_000e18);
         vm.warp(block.timestamp + 1 days);
-        tally.settle(ILK);
+        tally.settle();
         assertEq(usds.balanceOf(sub) - 10_000_000e18, 2_005e18);
     }
 
     function test_gift_pays_out_at_settle() public {
         _debt(1e18);
-        tally.gift(ILK, 1_000e18);
+        tally.gift(1_000e18);
         usds.mint(address(tally), 1_000e18);
-        tally.settle(ILK);
+        tally.settle();
         assertEq(usds.balanceOf(sub), 1_000e18);
     }
 
     function test_settle_permissionless() public {
         _debt(1e18);
         vm.prank(address(0xDEAD));
-        tally.settle(ILK);
+        tally.settle();
     }
 
     function test_settle_needs_only_allocator_roles() public {
         MockBuffer b2 = new MockBuffer();
         MockAllocatorVault v2 = new MockAllocatorVault(address(vat), address(join), ILK, address(b2));
-        tally.file(ILK, "vault", address(v2));
+        tally.file("vault", address(v2));
         _debt(1_000_000_000e18);
         vm.warp(block.timestamp + 1 days);
         vm.expectRevert("AllocatorVault/not-authorized");
-        tally.settle(ILK);
+        tally.settle();
     }
 
     function test_settle_requires_vault_when_minting() public {
-        tally.file(ILK, "vault", address(0));
+        tally.file("vault", address(0));
         _debt(1_000_000_000e18);
         vm.warp(block.timestamp + 1 days);
         vm.expectRevert("Tally/vault-not-set");
-        tally.settle(ILK);
+        tally.settle();
     }
 
     function test_quit_recovers_float_after_cage() public {
         usds.mint(address(tally), 5_000e18);
         tally.cage();
         vm.expectRevert("Tally/not-live");
-        tally.settle(ILK);
+        tally.settle();
         tally.quit(address(usds), address(0xF10A7), 5_000e18);
         assertEq(usds.balanceOf(address(0xF10A7)), 5_000e18);
         assertEq(usds.balanceOf(address(tally)), 0);

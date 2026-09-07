@@ -47,17 +47,19 @@ contract ObexForkTest is Test {
         rpc = vm.envString("ETH_RPC");
         vm.createSelectFork(rpc, BLOCKS[0]);
 
-        tally = new Tally(VAT, VOW, USDS_JOIN, USDS, SUSDS);
+        tally = new Tally(ILK, VAT, VOW, USDS_JOIN, USDS, SUSDS);
         RawPip     usdsPip  = new RawPip(USDS);
         RawPip     usdcPip  = new RawPip(USDC);
         Erc4626Pip syrupPip = new Erc4626Pip(SYRUP);
 
-        tally.init(ILK, ALM, SUB);
-        tally.file(ILK, "pad", 0.002e27);   // BR = SSR + 20 bps
-        tally.file(ILK, "tip", 0.002e27);   // agent rate = SSR + 20 bps
-        tally.init(ILK, USDS,  address(usdsPip),  tally.MTM());
-        tally.init(ILK, USDC,  address(usdcPip),  tally.MTM());
-        tally.init(ILK, SYRUP, address(syrupPip), tally.MTM());
+        tally.file("alm", ALM);
+        tally.file("sub", SUB);
+        tally.file("pad", 0.002e27);   // BR = SSR + 20 bps
+        tally.file("tip", 0.002e27);   // agent rate = SSR + 20 bps
+        tally.file("pay", 1);
+        tally.init(USDS,  address(usdsPip),  tally.MTM());
+        tally.init(USDC,  address(usdcPip),  tally.MTM());
+        tally.init(SYRUP, address(syrupPip), tally.MTM());
 
         vm.makePersistent(address(tally));
         vm.makePersistent(address(usdsPip));
@@ -66,24 +68,24 @@ contract ObexForkTest is Test {
     }
 
     function test_obex_august_2026() public {
-        uint256 som = tally.nav(ILK);
-        console2.log("SoM block %s  debt %s  nav %s", BLOCKS[0], tally.debt(ILK) / 1e18, som / 1e18);
-        console2.log("SoM syrupUSDC value (pipeline value_som = 402,261,461.63): %s", tally.value(ILK, SYRUP) / 1e14);
+        uint256 som = tally.nav();
+        console2.log("SoM block %s  debt %s  nav %s", BLOCKS[0], tally.debt() / 1e18, som / 1e18);
+        console2.log("SoM syrupUSDC value (pipeline value_som = 402,261,461.63): %s", tally.value(SYRUP) / 1e14);
 
         uint256 prevTab; uint256 prevOwe;
         for (uint256 d = 1; d < 32; d++) {
             vm.createSelectFork(rpc, BLOCKS[d]);
-            tally.drip(ILK);
-            tally.poke(ILK);
-            (uint256 t, uint256 o, int256 g,,,,,,) = tally.books(ILK);
-            console2.log("2026-08-%s  debt %s  sky/day %s", d, tally.debt(ILK) / 1e18, (t - prevTab) / 1e14);
+            tally.drip();
+            tally.poke();
+            (uint256 t, uint256 o, int256 g) = (tally.tab(), tally.owe(), tally.gain());
+            console2.log("2026-08-%s  debt %s  sky/day %s", d, tally.debt() / 1e18, (t - prevTab) / 1e14);
             console2.log("            agent/day %s  gain (cum) %s", (o - prevOwe) / 1e14, uint256(g) / 1e14);
             prevTab = t; prevOwe = o;
         }
 
-        (uint256 tab, uint256 owe, int256 gain,,,,,,) = tally.books(ILK);
-        uint256 eom = tally.nav(ILK);
-        console2.log("EoM syrupUSDC value (pipeline value_eom = 403,893,190.94): %s", tally.value(ILK, SYRUP) / 1e14);
+        (uint256 tab, uint256 owe, int256 gain) = (tally.tab(), tally.owe(), tally.gain());
+        uint256 eom = tally.nav();
+        console2.log("EoM syrupUSDC value (pipeline value_eom = 403,893,190.94): %s", tally.value(SYRUP) / 1e14);
         console2.log("");
         console2.log("                 Tally            pipeline");
         console2.log("sky share    %s   %s", tab / 1e14, PIPE_SKY / 1e14);

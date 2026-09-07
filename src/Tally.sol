@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-/// Tally.sol -- daily settlement cycle for a Sky prime agent
+/// Tally.sol -- daily settlement cycle for one Sky allocator ilk
 
 // Copyright (C) 2026 Soter Labs
 //
@@ -43,7 +43,6 @@ interface GemLike {
 }
 
 interface SusdsLike {
-    function ssr() external view returns (uint256);
     function balanceOf(address) external view returns (uint256);
     function convertToAssets(uint256 shares) external view returns (uint256);
 }
@@ -58,40 +57,44 @@ interface PipLike {
 
 /**
  * @title  Tally
- * @notice Daily Settlement Cycle (DSC) for a Sky prime agent.
+ * @notice Daily Settlement Cycle (DSC) for one Sky allocator ilk.
  *
- *         One instance per allocator ilk (e.g. ALLOCATOR-SPARK-A). The ilk
- *         points at an ALM Proxy (`alm`, whose positions are marked), a
- *         SubProxy (`sub`, paid at settle; its idle USDS / sUSDS earn the
+ *         One instance per ilk (e.g. ALLOCATOR-SPARK-A). It points at an
+ *         ALM Proxy (`alm`, whose positions are marked), a SubProxy (`sub`,
+ *         paid at settle; when `pay` is set its idle USDS / sUSDS earn the
  *         agent rate), and the prime's AllocatorVault / AllocatorBuffer
- *         (through which the Sky share is drawn as new ilk debt).
+ *         (through which the Sky share is drawn as new ilk debt). A prime
+ *         with several ilks deploys several instances that share `sub` and
+ *         sets `pay` on exactly one of them.
  *
  *         Jug-style, anyone can advance the clocks:
  *
- *         - `drip(ilk)` accrues the Sky side. The Base Rate charge is
- *           `debt * duty * dt` with `debt = Art * rate` read from the Vat
- *           and `duty` derived on-chain from `sUSDS.ssr()` at DAILY
- *           compounding plus a governance spread (`pad`). Also accrues
- *           the agent rate owed on the SubProxy's holdings.
+ *         - `drip()` accrues the Sky side. The Base Rate charge over the
+ *           interval is `debt * (dchi + pad * dt)`, where `dchi` is the
+ *           growth of the sUSDS share price since the last drip (the SSR,
+ *           compounded per second by sUSDS itself, so every SP-BEAM change
+ *           inside the interval is priced exactly) and `pad` is the
+ *           governance spread. Also accrues the agent rate on the SubProxy
+ *           and the sUSDS-spread / idle rebates on tagged positions.
  *
  *           Balances are sampled, not integrated, so every accrual is
  *           taken on the balance that is WORSE for the prime over the
  *           interval: the larger of the debt at the two ends, the smaller
- *           of the SubProxy / idle balances at the two ends. A prime that
- *           drips before it draws, wipes or moves funds is charged and
- *           credited exactly; one that does not pays for the interval at
- *           the higher balance. Nothing the prime does can under-charge Sky.
+ *           of the SubProxy / rebated balances at the two ends. A prime
+ *           that drips before it draws, wipes or moves funds is charged
+ *           and credited exactly; one that does not pays for the interval
+ *           at the higher balance. Nothing the prime does can under-charge
+ *           Sky.
  *
- *         - `poke(ilk, gem)` marks a position through its `pip` adapter and
+ *         - `poke(gem)` marks a position through its `pip` adapter and
  *           books `pie * (chi_new - chi_old)` as gain or loss. PnL is taken
  *           on the index, so relayer deposits and withdrawals between
- *           pokes are flows, not revenue. Each gem carries a `tag` that
- *           routes it: prime mark-to-market, Sky direct exposure, Sky
- *           savings token (spread rebate), idle (Base Rate rebate), or
- *           position-only.
+ *           pokes are flows, not revenue. Each gem carries a `tag`: prime
+ *           mark-to-market, Sky direct exposure, Sky savings token, idle,
+ *           or position-only.
  *
- *         - `settle(ilk)` does both, then executes the MSC identity in
- *           whole USDS:
+ *         - `settle()` does both, then executes the MSC identity in whole
+ *           USDS:
  *
  *             sky  = tab + sde - rebate           Sky share
  *             sv   = gain + rebate - tab - sin    prime supply share
@@ -108,7 +111,7 @@ interface PipLike {
  *           otherwise carried in `owe`. No Vat privileges are needed.
  *
  *         Amounts are wad regardless of token decimals; rates are ray.
- *         Annual rates (`pad`, `tip`, `cut`) are NOMINAL, applied as
+ *         `pad`, `tip`, `cut` are NOMINAL annual rates applied as
  *         `rate / 365 days` per second, per the MSC convention.
  */
 contract Tally {
@@ -130,34 +133,9 @@ contract Tally {
     uint8 public constant IDL = 4; // idle USDS-equivalent, not utilized:      Base Rate rebated  -> rebate
     uint8 public constant NIL = 5; // position-only, tracked but never booked
 
-    struct Ilk {
-        address alm;     // ALM Proxy: default holder of the gems
-        address sub;     // SubProxy: paid at settle, earns the agent rate
-        address vault;   // AllocatorVault: draws the mint as ilk debt
-        address buffer;  // AllocatorBuffer: where the vault delivers USDS
-        uint256 rho;     // time of last drip                                  [unix epoch time]
-        uint256 pad;     // Base Rate spread over SSR, annual nominal          [ray]
-        uint256 tip;     // agent-rate spread over SSR, annual nominal         [ray]
-        uint256 cut;     // subsidised Base Rate, annual nominal               [ray]
-        uint256 line;    // debt charged at `cut` (subsidy cap), 0 = no subsidy [wad]
-    }
-
-    // Accruals since the last settle, carries, and the balances last seen.
-    struct Book {
-        uint256 tab;    // Base Rate charge                                    [wad]
-        uint256 owe;    // demand side owed to the prime (agent rate, gifts, unpaid send) [wad]
-        int256  gain;   // prime mark-to-market                                [wad]
-        int256  sde;    // Sky-direct mark-to-market, incl. carried Sky share  [wad]
-        uint256 rebate; // rebates to the prime (sUSDS spread, idle BR)        [wad]
-        uint256 sin;    // negative prime supply share carried forward         [wad]
-        uint256 art;    // ilk debt at last drip                               [wad]
-        uint256 usd;    // SubProxy USDS at last drip                          [wad]
-        uint256 sus;    // SubProxy sUSDS value at last drip                   [wad]
-    }
-
     struct Gem {
         address pip;   // pricing adapter
-        address who;   // holder override, 0 = ilk.alm
+        address who;   // holder override, 0 = alm
         uint8   tag;   // MTM, SDE, SAV, IDL or NIL
         uint256 fee;   // redemption haircut on vault value                    [wad] (1e16 = 1%)
         uint256 cap;   // SDE only: Sky's capped slice, 0 = whole position     [wad]
@@ -167,16 +145,44 @@ contract Tally {
         uint256 own;   // queued assets at last poke                           [wad]
     }
 
-    mapping (bytes32 => Ilk)                       public ilks;
-    mapping (bytes32 => Book)                      public books;
-    mapping (bytes32 => mapping (address => Gem))  public gems;
-    mapping (bytes32 => address[])                 public list;
-
+    // System
+    bytes32   public immutable ilk;
     VatLike   public immutable vat;
-    address   public immutable vow;   // surplus buffer
-    JoinLike  public immutable join;  // UsdsJoin
+    address   public immutable vow;    // surplus buffer
+    JoinLike  public immutable join;   // UsdsJoin
     GemLike   public immutable usds;
     SusdsLike public immutable susds;
+
+    // Prime
+    address public alm;      // ALM Proxy: default holder of the gems
+    address public sub;      // SubProxy: paid at settle
+    address public vault;    // AllocatorVault: draws the mint as ilk debt
+    address public buffer;   // AllocatorBuffer: where the vault delivers USDS
+    uint256 public pay;      // 1 if this ilk carries the prime's demand side (agent rate, gifts)
+
+    // Rates
+    uint256 public pad;      // Base Rate spread over SSR, annual nominal          [ray]
+    uint256 public tip;      // agent-rate spread over SSR, annual nominal         [ray]
+    uint256 public cut;      // subsidised Base Rate, annual nominal               [ray]
+    uint256 public line;     // debt charged at `cut` (subsidy cap), 0 = no subsidy [wad]
+
+    // Book: accruals since the last settle and carries
+    uint256 public tab;      // Base Rate charge                                    [wad]
+    uint256 public owe;      // demand side owed to the prime (agent rate, gifts, unpaid send) [wad]
+    int256  public gain;     // prime mark-to-market                                [wad]
+    int256  public sde;      // Sky-direct mark-to-market, incl. carried Sky share  [wad]
+    uint256 public rebate;   // rebates to the prime (sUSDS spread, idle BR)        [wad]
+    uint256 public sin;      // negative prime supply share carried forward         [wad]
+
+    // Samples at last drip
+    uint256 public rho;      // time                                                [unix epoch time]
+    uint256 public chi;      // sUSDS share price, the SSR index                    [wad]
+    uint256 public art;      // ilk debt                                            [wad]
+    uint256 public usd;      // SubProxy USDS                                       [wad]
+    uint256 public sus;      // SubProxy sUSDS value                                [wad]
+
+    mapping (address => Gem) public gems;
+    address[]                public list;
 
     uint256 public live;
 
@@ -187,27 +193,30 @@ contract Tally {
     // --- Events ---
     event Rely(address indexed usr);
     event Deny(address indexed usr);
-    event Init(bytes32 indexed ilk, address alm, address sub);
-    event Init(bytes32 indexed ilk, address indexed gem, address pip, uint8 tag);
-    event File(bytes32 indexed ilk, bytes32 indexed what, uint256 data);
-    event File(bytes32 indexed ilk, bytes32 indexed what, address data);
-    event File(bytes32 indexed ilk, address indexed gem, bytes32 indexed what, uint256 data);
-    event File(bytes32 indexed ilk, address indexed gem, bytes32 indexed what, address data);
-    event Drip(bytes32 indexed ilk, uint256 debt, uint256 fee, uint256 agentRate);
-    event Poke(bytes32 indexed ilk, address indexed gem, uint256 pie, uint256 chi, uint256 own, uint256 val, int256 dpnl);
-    event Gift(bytes32 indexed ilk, uint256 wad);
-    event Settle(bytes32 indexed ilk, int256 sky, int256 sv, uint256 dv, uint256 mint, uint256 drew, uint256 send, uint256 paid, uint256 kept);
+    event Init(address indexed gem, address pip, uint8 tag);
+    event File(bytes32 indexed what, uint256 data);
+    event File(bytes32 indexed what, address data);
+    event File(address indexed gem, bytes32 indexed what, uint256 data);
+    event File(address indexed gem, bytes32 indexed what, address data);
+    event Drip(uint256 debt, uint256 dchi, uint256 fee, uint256 agentRate, uint256 rebates);
+    event Poke(address indexed gem, uint256 pie, uint256 chi, uint256 own, uint256 val, int256 dpnl);
+    event Gift(uint256 wad);
+    event Settle(int256 sky, int256 sv, uint256 dv, uint256 mint, uint256 drew, uint256 send, uint256 paid, uint256 kept);
     event Quit(address indexed gem, address indexed dst, uint256 wad);
     event Cage();
 
     // --- Init ---
-    constructor(address vat_, address vow_, address join_, address usds_, address susds_) {
+    constructor(bytes32 ilk_, address vat_, address vow_, address join_, address usds_, address susds_) {
+        ilk   = ilk_;
         vat   = VatLike(vat_);
         vow   = vow_;
         join  = JoinLike(join_);
         usds  = GemLike(usds_);
         susds = SusdsLike(susds_);
         live  = 1;
+        rho   = block.timestamp;
+        chi   = susds.convertToAssets(WAD);
+        art   = debt();
         wards[msg.sender] = 1;
         emit Rely(msg.sender);
         // The join burns from us when we credit the surplus buffer.
@@ -227,9 +236,6 @@ contract Tally {
     function _max(uint256 x, uint256 y) internal pure returns (uint256) {
         return x >= y ? x : y;
     }
-    function _max(int256 x, int256 y) internal pure returns (int256) {
-        return x >= y ? x : y;
-    }
     // whole USDS
     function _whole(uint256 wad) internal pure returns (uint256) {
         return wad / WAD * WAD;
@@ -239,97 +245,64 @@ contract Tally {
         return annual / YEAR;
     }
     // value of a mark
-    function _val(uint256 pie, uint256 chi, uint256 own) internal pure returns (uint256) {
-        return _rmul(pie, chi) + own;
-    }
-    // Jug's rpow.
-    function _rpow(uint256 x, uint256 n, uint256 b) internal pure returns (uint256 z) {
-        assembly {
-            switch x case 0 {switch n case 0 {z := b} default {z := 0}}
-            default {
-                switch mod(n, 2) case 0 { z := b } default { z := x }
-                let half := div(b, 2)  // for rounding.
-                for { n := div(n, 2) } n { n := div(n,2) } {
-                    let xx := mul(x, x)
-                    if iszero(eq(div(xx, x), x)) { revert(0,0) }
-                    let xxRound := add(xx, half)
-                    if lt(xxRound, xx) { revert(0,0) }
-                    x := div(xxRound, b)
-                    if mod(n,2) {
-                        let zx := mul(z, x)
-                        if and(iszero(iszero(x)), iszero(eq(div(zx, x), z))) { revert(0,0) }
-                        let zxRound := add(zx, half)
-                        if lt(zxRound, zx) { revert(0,0) }
-                        z := div(zxRound, b)
-                    }
-                }
-            }
-        }
+    function _val(uint256 pie, uint256 chi_, uint256 own) internal pure returns (uint256) {
+        return _rmul(pie, chi_) + own;
     }
 
     // --- Administration ---
-    function init(bytes32 ilk, address alm, address sub) external auth {
-        require(ilks[ilk].alm == address(0), "Tally/ilk-already-init");
-        ilks[ilk].alm = alm;
-        ilks[ilk].sub = sub;
-        ilks[ilk].rho = block.timestamp;
-        _seed(ilk);
-        emit Init(ilk, alm, sub);
-    }
 
-    function init(bytes32 ilk, address gem, address pip, uint8 tag) external auth {
-        require(ilks[ilk].alm != address(0), "Tally/ilk-not-init");
-        require(gems[ilk][gem].tag == 0, "Tally/gem-already-init");
+    function init(address gem, address pip, uint8 tag) external auth {
+        require(live == 1, "Tally/not-live");
+        require(gems[gem].tag == 0, "Tally/gem-already-init");
         require(tag >= MTM && tag <= NIL, "Tally/bad-tag");
-        Gem storage g = gems[ilk][gem];
+        Gem storage g = gems[gem];
         g.pip = pip;
         g.tag = tag;
         g.rho = block.timestamp;
-        list[ilk].push(gem);
+        list.push(gem);
         // Seed the index so the first real poke books no phantom PnL.
-        (g.pie, g.chi, g.own) = _read(ilk, gem);
-        emit Init(ilk, gem, pip, tag);
+        (g.pie, g.chi, g.own) = _read(gem);
+        emit Init(gem, pip, tag);
     }
 
-    // Rate parameters. Requires a drip AND a poke of every gem in this block,
-    // so no open interval (Base Rate, agent rate, SAV / IDL rebates) is
-    // re-priced retroactively.
-    function file(bytes32 ilk, bytes32 what, uint256 data) external auth {
+    // Rate parameters and the demand-side flag. Requires a drip AND a poke of
+    // every gem in this block, so no open interval is re-priced retroactively.
+    function file(bytes32 what, uint256 data) external auth {
         require(live == 1, "Tally/not-live");
-        require(block.timestamp == ilks[ilk].rho, "Tally/rho-not-updated");
-        address[] storage l = list[ilk];
-        for (uint256 k = 0; k < l.length; k++) {
-            require(block.timestamp == gems[ilk][l[k]].rho, "Tally/gem-rho-not-updated");
+        require(block.timestamp == rho, "Tally/rho-not-updated");
+        for (uint256 k = 0; k < list.length; k++) {
+            require(block.timestamp == gems[list[k]].rho, "Tally/gem-rho-not-updated");
         }
-        if      (what == "pad")  ilks[ilk].pad  = data;
-        else if (what == "tip")  ilks[ilk].tip  = data;
-        else if (what == "cut")  ilks[ilk].cut  = data;
-        else if (what == "line") ilks[ilk].line = data;
+        if      (what == "pad")  pad  = data;
+        else if (what == "tip")  tip  = data;
+        else if (what == "cut")  cut  = data;
+        else if (what == "line") line = data;
+        else if (what == "pay")  { require(data <= 1, "Tally/bad-flag"); pay = data; }
         else revert("Tally/file-unrecognized-param");
-        emit File(ilk, what, data);
+        emit File(what, data);
     }
 
-    function file(bytes32 ilk, bytes32 what, address data) external auth {
+    function file(bytes32 what, address data) external auth {
         require(live == 1, "Tally/not-live");
-        if      (what == "alm")    ilks[ilk].alm    = data;
-        else if (what == "vault")  ilks[ilk].vault  = data;
-        else if (what == "buffer") ilks[ilk].buffer = data;
+        if      (what == "alm")    alm    = data;
+        else if (what == "vault")  vault  = data;
+        else if (what == "buffer") buffer = data;
         else if (what == "sub") {
             // Drip first so the old SubProxy's interval is credited to it.
-            require(block.timestamp == ilks[ilk].rho, "Tally/rho-not-updated");
-            ilks[ilk].sub = data;
-            _seed(ilk);
+            require(block.timestamp == rho, "Tally/rho-not-updated");
+            sub = data;
+            (usd, sus) = _subs();
         }
         else revert("Tally/file-unrecognized-param");
-        emit File(ilk, what, data);
+        emit File(what, data);
     }
 
     // Gem parameters. Every change re-bases the gem: poke first so the open
     // interval is booked under the old parameters, then re-seed the mark so
     // the change itself is never booked as PnL or re-routed.
-    function file(bytes32 ilk, address gem, bytes32 what, uint256 data) external auth {
+    function file(address gem, bytes32 what, uint256 data) external auth {
         require(live == 1, "Tally/not-live");
-        Gem storage g = gems[ilk][gem];
+        Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
         require(block.timestamp == g.rho, "Tally/rho-not-updated");
         if (what == "fee") {
@@ -339,28 +312,29 @@ contract Tally {
         else if (what == "cap") g.cap = data;
         else if (what == "tag") { require(data >= MTM && data <= NIL, "Tally/bad-tag"); g.tag = uint8(data); }
         else revert("Tally/file-unrecognized-param");
-        (g.pie, g.chi, g.own) = _read(ilk, gem);
-        emit File(ilk, gem, what, data);
+        (g.pie, g.chi, g.own) = _read(gem);
+        emit File(gem, what, data);
     }
 
-    function file(bytes32 ilk, address gem, bytes32 what, address data) external auth {
+    function file(address gem, bytes32 what, address data) external auth {
         require(live == 1, "Tally/not-live");
-        Gem storage g = gems[ilk][gem];
+        Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
         require(block.timestamp == g.rho, "Tally/rho-not-updated");
         if      (what == "pip") g.pip = data;
         else if (what == "who") g.who = data;
         else revert("Tally/file-unrecognized-param");
-        (g.pie, g.chi, g.own) = _read(ilk, gem);
-        emit File(ilk, gem, what, data);
+        (g.pie, g.chi, g.own) = _read(gem);
+        emit File(gem, what, data);
     }
 
     /// @notice Credit an off-chain demand-side amount (e.g. Distribution
     ///         Rewards) to be paid at the next settle. The hybrid hook.
-    function gift(bytes32 ilk, uint256 wad) external auth {
+    function gift(uint256 wad) external auth {
         require(live == 1, "Tally/not-live");
-        books[ilk].owe += wad;
-        emit Gift(ilk, wad);
+        require(pay == 1, "Tally/not-paying");
+        owe += wad;
+        emit Gift(wad);
     }
 
     /// @notice Move tokens out (the USDS float, a mistaken transfer). Works
@@ -375,30 +349,10 @@ contract Tally {
         emit Cage();
     }
 
-    // --- Rates ---
-
-    /// @notice SSR as a per-second NOMINAL rate at daily compounding [ray]:
-    ///         `(ssr^86400 - 1) / 86400`. Summed over a day this is exactly
-    ///         the day's slice of the SSR APY, i.e. `n = 365` in the MSC's
-    ///         APY -> APR conversion, matching daily capitalisation.
-    function ssrps() public view returns (uint256) {
-        return (_rpow(susds.ssr(), 1 days, RAY) - RAY) / 1 days;
-    }
-
-    /// @notice Base Rate, per-second nominal [ray].
-    function duty(bytes32 ilk) public view returns (uint256) {
-        return ssrps() + _ps(ilks[ilk].pad);
-    }
-
-    /// @notice Rate paid on the marginal unit of debt `d`: `cut` inside the
-    ///         subsidy cap, the full Base Rate above it [ray, per second].
-    function _marginal(bytes32 ilk, uint256 d, uint256 sps) internal view returns (uint256) {
-        Ilk storage i = ilks[ilk];
-        return (i.line > 0 && d <= i.line) ? _ps(i.cut) : sps + _ps(i.pad);
-    }
+    // --- Reads ---
 
     /// @notice Ilk debt read from the Vat, `Art * rate` [wad]: the MSC's `cum_debt`.
-    function debt(bytes32 ilk) public view returns (uint256) {
+    function debt() public view returns (uint256) {
         (uint256 Art, uint256 rate,,,) = vat.ilks(ilk);
         return _rmul(Art, rate);
     }
@@ -406,130 +360,133 @@ contract Tally {
     /// @notice How much more the ilk can draw today [wad]: the tighter of the
     ///         ilk ceiling and the global ceiling, less one USDS for the
     ///         vault's round-up.
-    function room(bytes32 ilk) public view returns (uint256) {
-        (uint256 Art, uint256 rate,, uint256 line,) = vat.ilks(ilk);
+    function room() public view returns (uint256) {
+        (uint256 Art, uint256 rate,, uint256 line_,) = vat.ilks(ilk);
         uint256 d = Art * rate;
-        uint256 a = line > d ? (line - d) / RAY : 0;
+        uint256 a = line_ > d ? (line_ - d) / RAY : 0;
         uint256 L = vat.Line(); uint256 D = vat.debt();
         uint256 b = L > D ? (L - D) / RAY : 0;
         uint256 r = _min(a, b);
         return r > WAD ? r - WAD : 0;
     }
 
-    // Remember the balances an accrual is sampled against.
-    function _seed(bytes32 ilk) internal {
-        Book storage b = books[ilk];
-        address sub = ilks[ilk].sub;
-        b.art = debt(ilk);
-        b.usd = usds.balanceOf(sub);
+    function _subs() internal view returns (uint256 u, uint256 sv) {
+        u = usds.balanceOf(sub);
         uint256 s = susds.balanceOf(sub);
-        b.sus = s > 0 ? susds.convertToAssets(s) : 0;
+        sv = s > 0 ? susds.convertToAssets(s) : 0;
     }
 
     // --- Sky side ---
 
-    /// @notice Accrue the Base Rate charge and the agent rate since the last
-    ///         drip, then re-sample the balances. Calling `drip` in the same
-    ///         block as a draw, wipe or SubProxy transfer (before it) makes
-    ///         the accrual exact; the samples are always refreshed so a
-    ///         drip-then-move sequence starts the next interval on the
+    /// @notice Accrue since the last drip, then re-sample. Calling `drip` in
+    ///         the same block as a draw, wipe or SubProxy transfer (before
+    ///         it) makes the accrual exact; the samples are always refreshed
+    ///         so a drip-then-move sequence starts the next interval on the
     ///         post-move balance.
-    function drip(bytes32 ilk) public {
-        Ilk  storage i = ilks[ilk];
-        Book storage b = books[ilk];
-        require(i.alm != address(0), "Tally/ilk-not-init");
-        uint256 dt = block.timestamp - i.rho;
-
-        uint256 d  = debt(ilk);
-        uint256 u  = usds.balanceOf(i.sub);
-        uint256 s  = susds.balanceOf(i.sub);
-        uint256 sv = s > 0 ? susds.convertToAssets(s) : 0;
+    function drip() public {
+        uint256 dt = block.timestamp - rho;
+        uint256 d  = debt();
+        (uint256 u, uint256 sv) = _subs();
+        uint256 c  = susds.convertToAssets(WAD);
 
         if (dt > 0) {
-            uint256 sps = ssrps();
+            // SSR over the interval, as sUSDS itself compounded it [ray].
+            uint256 dchi = chi > 0 ? c * RAY / chi - RAY : 0;
+            uint256 br   = dchi + _ps(pad) * dt;          // Base Rate over the interval [ray]
 
             // Base Rate on the larger of the debt at both ends, subsidised up to `line`.
-            uint256 base = _max(d, b.art);
+            uint256 base = _max(d, art);
             uint256 fee;
-            if (i.line > 0) {
-                uint256 lo = _min(base, i.line);
-                fee = _rmul(lo, _ps(i.cut) * dt) + _rmul(base - lo, (sps + _ps(i.pad)) * dt);
+            if (line > 0) {
+                uint256 lo = _min(base, line);
+                fee = _rmul(lo, _ps(cut) * dt) + _rmul(base - lo, br);
             } else {
-                fee = _rmul(base, (sps + _ps(i.pad)) * dt);
+                fee = _rmul(base, br);
             }
-            b.tab += fee;
+            tab += fee;
 
             // Agent rate on the smaller of the SubProxy balances at both ends:
             // USDS earns SSR + tip, sUSDS earns tip (the SSR already arrives
-            // through the share price).
-            uint256 ar = _rmul(_min(u, b.usd), (sps + _ps(i.tip)) * dt)
-                       + _rmul(_min(sv, b.sus), _ps(i.tip) * dt);
-            b.owe += ar;
+            // through the share price). Only on the ilk that carries the
+            // prime's demand side.
+            uint256 ar;
+            if (pay == 1) {
+                ar = _rmul(_min(u, usd), dchi + _ps(tip) * dt)
+                   + _rmul(_min(sv, sus), _ps(tip) * dt);
+                owe += ar;
+            }
 
-            i.rho = block.timestamp;
-            emit Drip(ilk, d, fee, ar);
+            // Rebates on the smaller of the tagged positions' values at both
+            // ends. SAV hands back the spread; IDL hands back what the
+            // marginal unit of debt pays. Bounded by `tab` at settle.
+            uint256 rb = _rebates(dt, br, (line > 0 && base <= line) ? _ps(cut) * dt : br);
+            rebate += rb;
+
+            rho = block.timestamp;
+            emit Drip(d, dchi, fee, ar, rb);
         }
 
-        b.art = d;
-        b.usd = u;
-        b.sus = sv;
+        chi = c;
+        art = d;
+        usd = u;
+        sus = sv;
+    }
+
+    function _rebates(uint256 dt, uint256, uint256 marginal) internal view returns (uint256 rb) {
+        uint256 spread = _ps(pad) * dt;
+        for (uint256 k = 0; k < list.length; k++) {
+            Gem storage g = gems[list[k]];
+            if (g.tag != SAV && g.tag != IDL) continue;
+            (uint256 pie, uint256 chi_, uint256 own) = _read(list[k]);
+            uint256 v = _min(_val(pie, chi_, own), _val(g.pie, g.chi, g.own));
+            rb += _rmul(v, g.tag == SAV ? spread : marginal);
+        }
     }
 
     // --- Positions ---
 
-    function _read(bytes32 ilk, address gem) internal view returns (uint256 pie, uint256 chi, uint256 own) {
-        Gem storage g = gems[ilk][gem];
-        address who = g.who == address(0) ? ilks[ilk].alm : g.who;
-        (pie, chi, own) = PipLike(g.pip).peek(who);
-        chi = _wmul(chi, WAD - g.fee);
+    function _read(address gem) internal view returns (uint256 pie, uint256 chi_, uint256 own) {
+        Gem storage g = gems[gem];
+        address who = g.who == address(0) ? alm : g.who;
+        (pie, chi_, own) = PipLike(g.pip).peek(who);
+        chi_ = _wmul(chi_, WAD - g.fee);
     }
 
     /// @notice Mark one position and route the index move by tag.
-    function poke(bytes32 ilk, address gem) public returns (uint256 val) {
-        Gem  storage g = gems[ilk][gem];
-        Book storage b = books[ilk];
+    function poke(address gem) public returns (uint256 val) {
+        Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
 
-        (uint256 pie, uint256 chi, uint256 own) = _read(ilk, gem);
-        val = _val(pie, chi, own);
+        (uint256 pie, uint256 chi_, uint256 own) = _read(gem);
+        val = _val(pie, chi_, own);
         uint256 was = _val(g.pie, g.chi, g.own);
 
         // PnL on the shares carried through the interval, at the new index.
-        int256 dpnl = int256(_rmul(g.pie, chi)) - int256(_rmul(g.pie, g.chi));
+        int256 dpnl = int256(_rmul(g.pie, chi_)) - int256(_rmul(g.pie, g.chi));
 
         if (g.tag == MTM) {
-            b.gain += dpnl;
+            gain += dpnl;
         } else if (g.tag == SDE) {
             // Sky's share of the move: the whole position, or the capped
             // slice of the value the move was measured on.
             uint256 share = g.cap == 0 ? WAD : (was == 0 ? 0 : _min(WAD, g.cap * WAD / was));
             int256 s = dpnl * int256(share) / int256(WAD);
-            b.sde  += s;
-            b.gain += dpnl - s;
-        } else if (g.tag == SAV) {
-            // SSR appreciation stays in the token and is not revenue; Sky
-            // charges BR on it, so the spread is rebated for neutrality.
-            b.rebate += _rmul(_min(val, was), _ps(ilks[ilk].pad) * (block.timestamp - g.rho));
-        } else if (g.tag == IDL) {
-            // Not utilized (idle USDS, PSM3 USDS leg...): the Base Rate
-            // charged on it in `drip` is handed back at the rate the
-            // marginal unit of debt pays. Bounded by `tab` at settle.
-            b.rebate += _rmul(_min(val, was), _marginal(ilk, b.art, ssrps()) * (block.timestamp - g.rho));
+            sde  += s;
+            gain += dpnl - s;
         }
-        // NIL: tracked, nothing booked.
+        // SAV / IDL: rebated in drip; NIL: nothing booked.
 
         g.pie = pie;
-        g.chi = chi;
+        g.chi = chi_;
         g.own = own;
         g.rho = block.timestamp;
-        emit Poke(ilk, gem, pie, chi, own, val, dpnl);
+        emit Poke(gem, pie, chi_, own, val, dpnl);
     }
 
-    /// @notice Mark every position of an ilk. Returns the ilk NAV.
-    function poke(bytes32 ilk) public returns (uint256 tot) {
-        address[] storage l = list[ilk];
-        for (uint256 k = 0; k < l.length; k++) {
-            tot += poke(ilk, l[k]);
+    /// @notice Mark every position. Returns the NAV.
+    function poke() public returns (uint256 tot) {
+        for (uint256 k = 0; k < list.length; k++) {
+            tot += poke(list[k]);
         }
     }
 
@@ -548,20 +505,19 @@ contract Tally {
     }
 
     /// @notice Run the day: accrue, mark, and execute the MSC identity in whole USDS.
-    function settle(bytes32 ilk) external {
+    function settle() external {
         require(live == 1, "Tally/not-live");
-        drip(ilk);
-        poke(ilk);
+        drip();
+        poke();
 
-        Book storage b = books[ilk];
         Day memory d;
 
         // A rebate hands back Base Rate that was charged; never more.
-        uint256 rebate = _min(b.rebate, b.tab);
+        uint256 rb = _min(rebate, tab);
 
-        d.sky = int256(b.tab) + b.sde - int256(rebate);
-        d.sv  = b.gain + int256(rebate) - int256(b.tab) - int256(b.sin);
-        d.dv  = b.owe;
+        d.sky = int256(tab) + sde - int256(rb);
+        d.sv  = gain + int256(rb) - int256(tab) - int256(sin);
+        d.dv  = owe;
 
         // The demand side is always owed; a supply loss is carried against
         // future supply gains only, never netted against the demand side.
@@ -574,57 +530,55 @@ contract Tally {
         if (mint_ < 0) { carry = mint_; }
         else { d.mint = _whole(uint256(mint_)); carry = mint_ - int256(d.mint); }
 
-        d.drew = _draw(ilk, d.mint);
+        d.drew = _draw(d.mint);
         carry += int256(d.mint - d.drew);
 
-        b.tab = 0; b.gain = 0; b.rebate = 0;
-        b.sde = carry;
-        b.sin = d.sv < 0 ? uint256(-d.sv) : 0;
-        b.owe = (d.dv + d.up) - d.send;
+        tab = 0; gain = 0; rebate = 0;
+        sde = carry;
+        sin = d.sv < 0 ? uint256(-d.sv) : 0;
+        owe = (d.dv + d.up) - d.send;
 
         // Send: pay the SubProxy from the fresh draw, then from any USDS
         // governance keeps here; whatever cannot be paid is owed.
         d.paid = _min(d.send, usds.balanceOf(address(this)));
-        if (d.paid > 0) require(usds.transfer(ilks[ilk].sub, d.paid), "Tally/transfer-failed");
-        b.owe += d.send - d.paid;
+        if (d.paid > 0) require(usds.transfer(sub, d.paid), "Tally/transfer-failed");
+        owe += d.send - d.paid;
 
         // Keep: Sky's net goes to the surplus buffer.
         d.kept = d.drew > d.send ? d.drew - d.send : 0;
         if (d.kept > 0) join.join(vow, d.kept);
 
-        emit Settle(ilk, d.sky, d.sv, d.dv, d.mint, d.drew, d.send, d.paid, d.kept);
+        emit Settle(d.sky, d.sv, d.dv, d.mint, d.drew, d.send, d.paid, d.kept);
     }
 
     // Draw `mint` as new ilk debt through the prime's allocator stack, within
     // today's ceiling headroom, and pull it here. Returns what was drawn.
-    function _draw(bytes32 ilk, uint256 mint) internal returns (uint256 drew) {
+    function _draw(uint256 mint) internal returns (uint256 drew) {
         if (mint == 0) return 0;
-        Ilk storage i = ilks[ilk];
-        require(i.vault != address(0) && i.buffer != address(0), "Tally/vault-not-set");
-        drew = _whole(_min(mint, room(ilk)));
+        require(vault != address(0) && buffer != address(0), "Tally/vault-not-set");
+        drew = _whole(_min(mint, room()));
         if (drew > 0) {
-            VaultLike(i.vault).draw(drew);
-            require(usds.transferFrom(i.buffer, address(this), drew), "Tally/transfer-failed");
+            VaultLike(vault).draw(drew);
+            require(usds.transferFrom(buffer, address(this), drew), "Tally/transfer-failed");
         }
     }
 
     // --- Views ---
 
-    function value(bytes32 ilk, address gem) external view returns (uint256) {
-        require(gems[ilk][gem].tag != 0, "Tally/gem-not-init");
-        (uint256 pie, uint256 chi, uint256 own) = _read(ilk, gem);
-        return _val(pie, chi, own);
+    function value(address gem) external view returns (uint256) {
+        require(gems[gem].tag != 0, "Tally/gem-not-init");
+        (uint256 pie, uint256 chi_, uint256 own) = _read(gem);
+        return _val(pie, chi_, own);
     }
 
-    function nav(bytes32 ilk) external view returns (uint256 tot) {
-        address[] storage l = list[ilk];
-        for (uint256 k = 0; k < l.length; k++) {
-            (uint256 pie, uint256 chi, uint256 own) = _read(ilk, l[k]);
-            tot += _val(pie, chi, own);
+    function nav() external view returns (uint256 tot) {
+        for (uint256 k = 0; k < list.length; k++) {
+            (uint256 pie, uint256 chi_, uint256 own) = _read(list[k]);
+            tot += _val(pie, chi_, own);
         }
     }
 
-    function count(bytes32 ilk) external view returns (uint256) {
-        return list[ilk].length;
+    function count() external view returns (uint256) {
+        return list.length;
     }
 }
