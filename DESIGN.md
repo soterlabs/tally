@@ -287,7 +287,46 @@ made per chain and upgraded later without touching `Tally`.
   SDE shares, gem re-basing, and `quit` after `cage`. The mocks match the real
   AllocatorBuffer (approve only) and the ERC-7575 share layout.
 
-## 5. Decisions log
+## 5. Backtest: Obex, August 2026
+
+`test/Obex.fork.t.sol` deploys `Tally` on a mainnet fork at the July 31
+end-of-day block (the pipeline's `pin_blocks_som`), makes it persistent, and
+walks the end-of-day block of every day of August calling `drip` and `poke`.
+Obex is the simplest prime: one venue (Maple syrupUSDC, ERC-4626), one ilk
+(ALLOCATOR-OBEX-A), no subsidy, no flows in the month.
+
+```
+ETH_RPC=<archive mainnet rpc> forge test --match-contract ObexFork -vv
+```
+
+| | Tally (daily) | settlement-cycle (monthly) | ratio |
+|---|---:|---:|---:|
+| syrupUSDC value, SoM | 402,261,461.63 | 402,261,461.63 | exact |
+| syrupUSDC value, EoM | 403,893,190.94 | 403,893,190.94 | exact |
+| prime revenue (`gain`) | 1,631,729.31 | 1,631,729.31 | exact, to the cent |
+| Sky share (`tab`) | 1,247,071.87 | 1,248,716.85 | 0.998683 |
+| agent rate (`owe`) | 75,136.45 | 75,327.60 | 0.997462 |
+
+The two ratios are explained in full:
+
+- **0.998682 is the APY→APR conversion frequency.** The pipeline converts the
+  3.52% SSR at `n = 12` (3.464456% + 20 bps = 3.664456%) because the MSC
+  capitalises monthly. `Tally` converts at `n = 365` (3.459626% + 20 bps =
+  3.659626%) because it capitalises daily. Same charge in settled dollars
+  over a year, as `docs/RULES.md` Rule 1 argues; different daily slices.
+- **The agent rate carries one extra day of the sampling rule.** The MSC#11
+  payment landed at the Obex SubProxy on August 17. The pipeline's
+  include-same-day convention credits the larger balance from that day; the
+  sampling rule credits it from the next `drip`. One day of agent rate on the
+  increment is 92 USDS, which is the whole residual. The Sky charge shows
+  the mirror image on the same day, where the pipeline and the `max` rule
+  agree: the debt step on August 17 is charged from August 17 in both.
+
+The daily `drip` log matches the pipeline's `sky_revenue_daily` rows day by
+day up to the conversion factor: 40,105.09 versus 40,157.99 before the
+August 17 step, 40,359.36 versus 40,412.60 after it.
+
+## 6. Decisions log
 
 2026-09-07: daily capitalisation; charge on full `Art × rate`; subsidy filed
 by governance; `duty` from `sUSDS.ssr()`; adapter architecture; per-vault
