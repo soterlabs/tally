@@ -250,6 +250,27 @@ is that `Tally` becomes a Vat ward, the highest privilege in the system, for
 a keeper-triggered daily contract. Decision: `draw` via the allocator stack;
 the frozen-rate convention is not load-bearing and could be revisited.
 
+### 2.7 Operations: `TallyJob`
+
+`src/TallyJob.sol` is a dss-cron job for Sky's keeper networks. It holds the
+list of `Tally` instances and implements `IJob`:
+
+- `due(tally)`: the instance is live and a new UTC day has begun since its
+  last `settle` (`zzz`). `drip` moving `rho` does not count, so a relayer
+  drip before a draw never suppresses the day's settle.
+- `workable(network)`: false unless the network is the Sequencer's master;
+  otherwise the first due instance whose `settle` succeeds in simulation.
+  The trial `settle` runs inside the keeper's `eth_call`, so a stale relay
+  mark or a missing allocator role makes that instance skipped rather than
+  reported, and no keeper gas is burnt on a revert.
+- `work(network, args)`: master check, decode the instance, `ShouldNotTrigger`
+  unless it is listed and due, then `settle`. One instance per call; the
+  keeper loops until nothing is workable.
+
+Governance `rely`s on the job only to `add` / `remove` instances. `settle`
+stays permissionless, so the job is a convenience, not a gate: anyone,
+including the prime, can settle early or out of band.
+
 ## 3. What stays off-chain (hybrid boundary)
 
 - Idle deductions from utilized (most sit on L2s) **[D]**: the on-chain BR
@@ -370,6 +391,9 @@ exactly and a long gap compounds as sUSDS does; one instance per ilk with
 a prime with two ilks pays the agent rate once; rebates accrue in `drip` on
 the drip interval. Obex backtest unchanged on the daily cadence.
 
+2026-09-08: `TallyJob` (dss-cron `IJob`) settles each instance once per UTC
+day; `zzz` records the last settle so relayer drips do not suppress it.
+
 Open: contract name (`Tally` stands; `Till` is the short alternative); float
 sizing and top-up cadence; teaching the ALM controller to `drip` before
-`mintUSDS` / `burnUSDS`; a `TallyJob` for the keeper network.
+`mintUSDS` / `burnUSDS`.

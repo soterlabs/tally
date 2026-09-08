@@ -174,6 +174,8 @@ contract Tally {
     uint256 public rebate;   // rebates to the prime (sUSDS spread, idle BR)        [wad]
     uint256 public sin;      // negative prime supply share carried forward         [wad]
 
+    uint256 public zzz;      // time of last settle                                 [unix epoch time]
+
     // Samples at last drip
     uint256 public rho;      // time                                                [unix epoch time]
     uint256 public chi;      // sUSDS share price, the SSR index                    [wad]
@@ -548,6 +550,7 @@ contract Tally {
         d.kept = d.drew > d.send ? d.drew - d.send : 0;
         if (d.kept > 0) join.join(vow, d.kept);
 
+        zzz = block.timestamp;
         emit Settle(d.sky, d.sv, d.dv, d.mint, d.drew, d.send, d.paid, d.kept);
     }
 
