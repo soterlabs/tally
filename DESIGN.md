@@ -321,44 +321,75 @@ made per chain and upgraded later without touching `Tally`.
   SDE shares, gem re-basing, and `quit` after `cage`. The mocks match the real
   AllocatorBuffer (approve only) and the ERC-7575 share layout.
 
-## 5. Backtest: Obex, August 2026
+## 5. Backtests, August 2026
 
-`test/Obex.fork.t.sol` deploys `Tally` on a mainnet fork at the July 31
+`test/Backtest.t.sol` deploys `Tally` on a mainnet fork at the July 31
 end-of-day block (the pipeline's `pin_blocks_som`), makes it persistent, and
 walks the end-of-day block of every day of August calling `drip` and `poke`.
-Obex is the simplest prime: one venue (Maple syrupUSDC, ERC-4626), one ilk
-(ALLOCATOR-OBEX-A), no subsidy, no flows in the month.
+Three primes, in increasing difficulty.
 
 ```
-ETH_RPC=<archive mainnet rpc> forge test --match-contract ObexFork -vv
+ETH_RPC=<archive mainnet rpc> forge test --match-contract Fork -vv
 ```
 
-| | Tally (daily) | settlement-cycle (monthly) | ratio |
+(Cold RPC cache: Obex 5 min, Osero 2 min, Grove 17 min. Warm: seconds.)
+
+### Obex: one venue (Maple syrupUSDC), no flows
+
+| | Tally (daily) | pipeline (monthly) | ratio |
 |---|---:|---:|---:|
-| syrupUSDC value, SoM | 402,261,461.63 | 402,261,461.63 | exact |
-| syrupUSDC value, EoM | 403,893,190.94 | 403,893,190.94 | exact |
-| prime revenue (`gain`) | 1,631,729.31 | 1,631,729.31 | exact, to the cent |
-| Sky share (`tab`) | 1,247,071.87 | 1,248,716.85 | 0.998683 |
-| agent rate (`owe`) | 75,136.45 | 75,327.60 | 0.997462 |
+| prime revenue | 1,631,729.31 | 1,631,729.31 | exact, to the cent |
+| Sky share | 1,247,071.87 | 1,248,716.85 | 0.998683 |
+| agent rate | 75,136.44 | 75,327.60 | 0.997462 |
 
-The two ratios are explained in full:
+### Osero: SparkLend spUSDS (rebasing aToken), 13M deposit mid-month
 
-- **0.998682 is the APY→APR conversion frequency.** The pipeline converts the
-  3.52% SSR at `n = 12` (3.464456% + 20 bps = 3.664456%) because the MSC
-  capitalises monthly. `Tally` converts at `n = 365` (3.459626% + 20 bps =
-  3.659626%) because it capitalises daily. Same charge in settled dollars
-  over a year, as `docs/RULES.md` Rule 1 argues; different daily slices.
-- **The agent rate carries one extra day of the sampling rule.** The MSC#11
-  payment landed at the Obex SubProxy on August 17. The pipeline's
-  include-same-day convention credits the larger balance from that day; the
-  sampling rule credits it from the next `drip`. One day of agent rate on the
-  increment is 92 USDS, which is the whole residual. The Sky charge shows
-  the mirror image on the same day, where the pipeline and the `max` rule
-  agree: the debt step on August 17 is charged from August 17 in both.
+| | Tally (daily) | pipeline (monthly) | ratio |
+|---|---:|---:|---:|
+| prime revenue | 5,557.81 | 5,557.82 | exact, to the cent |
+| Sky share | 11,333.36 | 7,005.67 | 1.618 |
+| agent rate | 31,098.68 | 31,140.91 | 0.998644 |
 
-The daily `drip` log matches the pipeline's `sky_revenue_daily` rows day by
-day up to the conversion factor: 40,105.09 versus 40,157.99 before the
-August 17 step, 40,359.36 versus 40,412.60 after it.
+### Grove: two ilks, 5 chains, RWA tranches, LP, cash distributions, subsidy, SDE
+
+Marked: Ethereum venues with an adapter (aTokens, Morpho vaults, syrupUSDC,
+JAAA and JTRSY through the ERC-7540 adapter, BUIDL at par, idle stables, sUSDS,
+alt-holder and escrow balances). Not marked: STAC (Chronicle NAV), Curve and
+Uniswap V3 LP, the EOA relay, AUSD incentive and Galaxy cash distributions, and
+every venue on Base, Avalanche, Plume and Monad.
+
+| | Tally (daily) | pipeline (monthly) | note |
+|---|---:|---:|---|
+| prime revenue, marked venues (E4, E6, E8) | 614,598.87 | 614,503.16 | $96 apart: E6 was fully redeemed mid-month, E4 took a 3M deposit |
+| prime revenue, all venues | 614,598.87 | 4,913,183.00 | the other 4.3M is STAC, LP, cash distributions and four other chains |
+| SDE revenue, JTRSY | 2,507,334.74 | 2,507,613.29 | $279: fulfilled redeems at their fixed claim vs at NAV |
+| SDE revenue, BUIDL | 0 | 2,111,592.75 | yield arrives as mints, which are flows to an index reader |
+| Sky share (BR leg) | 8,593,819.39 | 3,720,604.84 | full debt vs debt less 1.57B of SDE assets |
+| agent rate | 78,036.49 | 78,320.96 | conversion factor plus the sampling rule on the Aug 17 payment |
+
+### What the three runs establish
+
+- **Position accounting is exact where the data is on-chain.** Every ERC-4626,
+  ERC-7540 and aToken venue reproduces the pipeline to the cent or within a
+  day's yield on a mid-month flow, across three primes and 24 venues. The
+  aToken case is the one that produced the +$667K MSC#11 restatement
+  off-chain.
+- **The Sky share differs only by things we chose to leave off-chain**: the
+  APY→APR conversion frequency (0.998682, intended), and the utilized
+  deductions. For Osero that is the prime's share of unborrowed USDS in the
+  SparkLend pool (38% of its debt on day one); for Grove it is the 1.57B of
+  SDE assets excluded from the Base Rate base. Both are readable on-chain
+  and would be `IDL`-tagged gems if wanted: lending idle as
+  `spToken.balanceOf(alm) / totalSupply × USDS.balanceOf(spToken)`, SDE
+  exclusion as the SDE gems' own value.
+- **Two things an index reader cannot see**: yield delivered as new tokens
+  (BUIDL mints, Galaxy and Agora cash sweeps) and NAVs that live only in an
+  oracle (STAC on Chronicle). The first is a flow-classification problem
+  that needs Transfer history, so it stays hybrid; the second is a
+  `ChroniclePip` away.
+- **Cross-chain** is the largest gap for Grove (2.55M of 4.91M prime revenue
+  is on Base, Avalanche and Plume) and is the operator-relay path already
+  agreed.
 
 ## 6. Decisions log
 
@@ -393,6 +424,7 @@ the drip interval. Obex backtest unchanged on the daily cadence.
 
 2026-09-08: `TallyJob` (dss-cron `IJob`) settles each instance once per UTC
 day; `zzz` records the last settle so relayer drips do not suppress it.
+Backtests for Osero and Grove added alongside Obex (§5).
 
 Open: contract name (`Tally` stands; `Till` is the short alternative); float
 sizing and top-up cadence; teaching the ALM controller to `drip` before

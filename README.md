@@ -14,10 +14,10 @@ On-chain, daily counterpart of the Monthly Settlement Cycle (`../settlement-cycl
 - `src/TallyJob.sol` — dss-cron job: settles each instance once per UTC day, skipping any whose settle would revert.
 - `src/Pips.sol` — adapters: raw stablecoin, ERC-4626, ERC-7540, Aave/SparkLend aToken, relayed.
 - `test/Tally.t.sol`, `test/TallyJob.t.sol` — 33 tests against mocks.
-- `test/Obex.fork.t.sol` — mainnet fork backtest: Obex, August 2026, versus `settlement-cycle` (see `DESIGN.md` §5).
+- `test/Backtest.t.sol` — mainnet fork backtests: Obex, Osero and Grove, August 2026, versus `settlement-cycle` (see `DESIGN.md` §5).
 
 ```shell
 forge build
 forge test                                                   # unit tests, mocks
-ETH_RPC=<archive rpc> forge test --match-contract ObexFork -vv   # August 2026 backtest against the MSC
+ETH_RPC=<archive rpc> forge test --match-contract Fork -vv       # August 2026 backtests against the MSC
 ```
