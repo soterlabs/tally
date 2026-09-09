@@ -128,7 +128,7 @@ contract Tally {
     // --- Data ---
     // Where a gem's marks go.
     uint8 public constant MTM = 1; // prime mark-to-market                    -> gain
-    uint8 public constant SDE = 2; // Sky direct exposure (cap-aware share)    -> sde, remainder -> gain
+    uint8 public constant SDE = 2; // Sky direct exposure (cap-aware share)    -> sde, remainder -> gain; BR rebated on Sky's slice
     uint8 public constant SAV = 3; // Sky savings token: SSR stays in the token; spread rebated   -> rebate
     uint8 public constant IDL = 4; // idle USDS-equivalent, not utilized:      Base Rate rebated  -> rebate
     uint8 public constant NIL = 5; // position-only, tracked but never booked
@@ -434,13 +434,18 @@ contract Tally {
         sus = sv;
     }
 
+    // SAV hands back the spread. IDL hands back what the marginal unit of
+    // debt pays. SDE does the same on Sky's slice: Sky takes that slice's
+    // yield directly, so charging Base Rate on it would bill twice (the MSC
+    // excludes `sde_av` from utilized).
     function _rebates(uint256 dt, uint256, uint256 marginal) internal view returns (uint256 rb) {
         uint256 spread = _ps(pad) * dt;
         for (uint256 k = 0; k < list.length; k++) {
             Gem storage g = gems[list[k]];
-            if (g.tag != SAV && g.tag != IDL) continue;
+            if (g.tag != SAV && g.tag != IDL && g.tag != SDE) continue;
             (uint256 pie, uint256 chi_, uint256 own) = _read(list[k]);
             uint256 v = _min(_val(pie, chi_, own), _val(g.pie, g.chi, g.own));
+            if (g.tag == SDE && g.cap > 0) v = _min(v, g.cap);
             rb += _rmul(v, g.tag == SAV ? spread : marginal);
         }
     }
@@ -485,10 +490,12 @@ contract Tally {
         emit Poke(gem, pie, chi_, own, val, dpnl);
     }
 
-    /// @notice Mark every position. Returns the NAV.
+    /// @notice Mark every position. Returns the NAV (IDL gems are memo items
+    ///         inside other positions and are not added).
     function poke() public returns (uint256 tot) {
         for (uint256 k = 0; k < list.length; k++) {
-            tot += poke(list[k]);
+            uint256 v = poke(list[k]);
+            if (gems[list[k]].tag != IDL) tot += v;
         }
     }
 
@@ -576,6 +583,7 @@ contract Tally {
 
     function nav() external view returns (uint256 tot) {
         for (uint256 k = 0; k < list.length; k++) {
+            if (gems[list[k]].tag == IDL) continue;   // memo item, not an asset
             (uint256 pie, uint256 chi_, uint256 own) = _read(list[k]);
             tot += _val(pie, chi_, own);
         }

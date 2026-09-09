@@ -3,7 +3,9 @@ pragma solidity ^0.8.21;
 
 import { Test, console2 } from "forge-std/Test.sol";
 import { Tally } from "../src/Tally.sol";
-import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip } from "../src/Pips.sol";
+import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip } from "../src/Pips.sol";
+
+interface KissLike { function kiss(address) external; }
 
 /// August 2026 backtests on a mainnet fork against settlements/<prime>/2026-08
 /// in settlement-cycle. Deploy at the July 31 end-of-day block (the pipeline's
@@ -34,7 +36,9 @@ abstract contract ForkBase is Test {
 
     string rpc;
 
-    function _fork(uint256 d) internal { vm.createSelectFork(rpc, BLOCKS[d]); }
+    function _fork(uint256 d) internal { vm.createSelectFork(rpc, BLOCKS[d]); _afterFork(); }
+    // Per-fork fixtures that live in non-persistent contracts (e.g. an oracle whitelist).
+    function _afterFork() internal virtual {}
 
     function _new(bytes32 ilk, address alm, address sub, uint256 pay) internal returns (Tally t) {
         t = new Tally(ilk, VAT, VOW, USDS_JOIN, USDS, SUSDS);
@@ -64,6 +68,15 @@ abstract contract ForkBase is Test {
     function _atoken(Tally t, address aToken, uint8 tag) internal {
         ATokenPip p = new ATokenPip(aToken); vm.makePersistent(address(p));
         t.init(aToken, address(p), tag);
+    }
+    // The holder's share of unborrowed underlying in the pool, as an IDL gem next to the aToken.
+    function _idle(Tally t, address aToken) internal {
+        LendingIdlePip p = new LendingIdlePip(aToken); vm.makePersistent(address(p));
+        t.init(address(uint160(aToken) + 1), address(p), t.IDL());
+    }
+    function _chronicle(Tally t, address gem, address oracle, uint8 tag) internal returns (ChroniclePip p) {
+        p = new ChroniclePip(gem, oracle); vm.makePersistent(address(p));
+        t.init(gem, address(p), tag);
     }
 
     function _run(Tally[] memory ts, string memory name) internal {
@@ -95,6 +108,7 @@ abstract contract ForkBase is Test {
         console2.log("sde revenue     %s      %s", uint256(sde) / 1e16, pSde / 1e16);
         console2.log("agent rate      %s      %s", owe / 1e16, pAgent / 1e16);
         console2.log("rebates         %s", rebate / 1e16);
+        console2.log("net BR (tab-rb) %s", (tab - (rebate < tab ? rebate : tab)) / 1e16);
         console2.log("(cents)");
     }
 }
@@ -161,13 +175,21 @@ contract OseroForkTest is ForkBase {
         _fork(0);
         t = _new(ILK, ALM, SUB, 1);
         _atoken(t, SPUSDS, t.MTM());
+        _idle(t, SPUSDS);              // prime's share of unborrowed USDS in SparkLend: not utilized
         _raw(t, USDS, t.MTM());
     }
 
     function test_osero_august_2026() public {
         Tally[] memory ts = new Tally[](1); ts[0] = t;
         _run(ts, "osero");
-        (uint256 tab, int256 gain,, uint256 owe,) = _report(ts, PIPE_SKY, PIPE_PRIME, 0, PIPE_AGENT);
+        (uint256 tab, int256 gain,, uint256 owe, uint256 rebate) = _report(ts, PIPE_SKY, PIPE_PRIME, 0, PIPE_AGENT);
+        // Net Base Rate = full debt less the lending-idle rebate: the pipeline's
+        // utilized. The residual is the sampling rule on the day of the 13M
+        // draw: debt is charged at the new balance (max) while the idle share
+        // is credited at the old one (min). A relayer that drips before drawing
+        // removes it. Conservative for Sky by construction.
+        assertApproxEqRel(tab - rebate, PIPE_SKY * N_RATIO / 1e18, 0.1e18);
+        assertGe(tab - rebate, PIPE_SKY * N_RATIO / 1e18);
 
         // aToken yield through scaledBalance x liquidityIndex, daily: index PnL
         // with a 13M flow mid-month. Expect agreement within a day's yield on
@@ -175,9 +197,7 @@ contract OseroForkTest is ForkBase {
         // approximation.
         assertApproxEqRel(uint256(gain), PIPE_PRIME, 0.3e18);
         assertApproxEqRel(owe, PIPE_AGENT * N_RATIO / 1e18, 0.002e18);
-        // Sky share is on full debt, the pipeline on utilized (debt - lending idle):
-        // Tally must be higher.
-        assertGt(tab, PIPE_SKY);
+        assertGt(tab, PIPE_SKY);   // gross, before the idle rebate
     }
 }
 
@@ -212,6 +232,10 @@ contract GroveForkTest is ForkBase {
     address constant RLUSD       = 0x8292Bb45bf1Ee4d140127049757C2E0fF06317eD;
     address constant AUSD        = 0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a;
     address constant PYUSD       = 0x6c3ea9036406852006290770BEdFcAbA0e23A0e8;
+    address constant STAC        = 0x51C2d74017390CbBd30550179A16A1c28F7210fc;
+    address constant STAC_ORACLE = 0x802CaCc19B9b3eb474C7DEf6f28c64AB67fb0753;   // Chronicle
+    address constant CHRONICLE_AUTHED = 0x62a69d7832040Cd629Ee2f712b4C8639C0F905D7;
+    ChroniclePip stacPip;
 
     uint256 constant PIPE_SKY   = 8339810.888358439873673301e18;
     uint256 constant PIPE_PRIME = 4913183.004893321502279642e18;
@@ -219,6 +243,17 @@ contract GroveForkTest is ForkBase {
     uint256 constant PIPE_AGENT = 78320.958615627202319059e18;
 
     Tally bloom; Tally grove;
+
+    // Chronicle feeds are toll-gated; the whitelist lives in the oracle, which
+    // is re-read fresh on every fork, so re-kiss the pip each time.
+    function _afterFork() internal override {
+        if (address(stacPip) == address(0)) {
+            // First fork: the pip does not exist yet; precompute its address.
+            return;
+        }
+        vm.prank(CHRONICLE_AUTHED);
+        KissLike(STAC_ORACLE).kiss(address(stacPip));
+    }
 
     function setUp() public {
         rpc = vm.envString("ETH_RPC");
@@ -230,9 +265,9 @@ contract GroveForkTest is ForkBase {
         bloom.file("cut", 0.036613e27);
         bloom.file("line", 1_000_000_000e18);
 
-        // Ethereum venues with an on-chain adapter. Not marked: STAC (Chronicle
-        // oracle), Curve / Uniswap V3 LP, the EOA relay, cash distributions,
-        // and everything on Base, Avalanche, Plume, Monad.
+        // Ethereum venues with an on-chain adapter. Not marked: Curve / Uniswap
+        // V3 LP, the EOA relay, cash distributions, and everything on Base,
+        // Avalanche, Plume, Monad.
         _atoken(bloom, A_RLUSD_HOR, bloom.MTM());
         _atoken(bloom, A_USDC_HOR,  bloom.MTM());
         _atoken(bloom, A_RLUSD,     bloom.MTM());
@@ -241,6 +276,9 @@ contract GroveForkTest is ForkBase {
         _v4626(bloom, STEAK_AUSD,  bloom.MTM());
         _v4626(bloom, STEAK_PYUSD, bloom.MTM());
         _v4626(bloom, SYRUP,       bloom.MTM());
+        stacPip = new ChroniclePip(STAC, STAC_ORACLE); vm.makePersistent(address(stacPip));
+        _afterFork();   // kiss before the first read in init
+        bloom.init(STAC, address(stacPip), bloom.MTM());
         _v7540(bloom, JAAA,  JAAA_VAULT,  bloom.MTM());
         _v7540(bloom, JTRSY, JTRSY_VAULT, bloom.SDE());
         _raw(bloom, BUIDL, bloom.SDE());          // const $1; its yield arrives as mints (flows)
@@ -259,18 +297,27 @@ contract GroveForkTest is ForkBase {
     }
 
     // Pipeline per-venue revenue for the venues marked above (settlements/grove/2026-08).
-    uint256 constant PIPE_E4_E6_E8 = 7322.92e18 + 36533.48e18 + 570646.76e18;   // Steakhouse USDC, Steakhouse AUSD, JAAA
+    uint256 constant PIPE_MARKED   = 7322.92e18 + 36533.48e18 + 570646.76e18 + 469275.10e18;   // Steakhouse USDC, Steakhouse AUSD, JAAA, STAC
+    uint256 constant PIPE_COF      = 3720604.844326282036275795e18;   // subsidy_summary.actual_cof: BR on utilized
     uint256 constant PIPE_E9       = 2507613.29e18;                              // JTRSY (SDE)
 
     function test_grove_august_2026() public {
         Tally[] memory ts = new Tally[](2); ts[0] = bloom; ts[1] = grove;
         _run(ts, "grove");
-        (uint256 tab, int256 gain, int256 sde, uint256 owe,) = _report(ts, PIPE_SKY, PIPE_PRIME, PIPE_SDE, PIPE_AGENT);
+        (uint256 tab, int256 gain, int256 sde, uint256 owe, uint256 rebate) = _report(ts, PIPE_SKY, PIPE_PRIME, PIPE_SDE, PIPE_AGENT);
 
-        // Prime revenue of the marked Ethereum venues: within $100 of the
-        // pipeline's sum for the same three venues (E6 was fully redeemed
-        // mid-month, E4 took a 3M deposit).
-        assertApproxEqAbs(uint256(gain), PIPE_E4_E6_E8, 150e18);
+        // Prime revenue of the marked Ethereum venues: within $150 of the
+        // pipeline's sum for the same four venues (E6 was fully redeemed
+        // mid-month, E4 took a 3M deposit, STAC through Chronicle).
+        assertApproxEqAbs(uint256(gain), PIPE_MARKED, 150e18);
+        // Net Base Rate: full debt at cut/BR less the SDE slice's rebate ==
+        // the pipeline's utilized (debt - sde_av) at the same tiers. The 0.6%
+        // residual is the sampling rule on the day BUIDL was redeemed (75M)
+        // and debt wiped (91M): debt charged at the higher reading, SDE slice
+        // rebated at the lower. Conservative for Sky; a drip before the wipe
+        // removes it.
+        assertApproxEqRel(tab - rebate, PIPE_COF, 0.01e18);
+        assertGe(tab - rebate, PIPE_COF);
         // JTRSY: the pipeline values escrowed shares at NAV, Tally values the
         // fulfilled part at its fixed claim (maxWithdraw): ~280 USDS apart.
         assertApproxEqAbs(uint256(sde), PIPE_E9, 400e18);

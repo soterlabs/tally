@@ -202,3 +202,157 @@ contract RelayPip is Pip {
         return (m.pie, m.chi, m.own);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Adapters added after the August 2026 backtests.
+// ---------------------------------------------------------------------------
+
+interface ChronicleLike {
+    function read() external view returns (uint256);   // wad; reverts unless the caller is kissed
+}
+
+/// Token priced by a Chronicle oracle (STAC; JAAA / JTRSY fallback). The pip
+/// must be `kiss`ed on the oracle by Chronicle's authed owners, as any
+/// on-chain reader of a Chronicle feed is.
+contract ChroniclePip is Pip {
+    TokenLike     public immutable gem;
+    ChronicleLike public immutable oracle;
+    uint8         public immutable dec;
+
+    constructor(address gem_, address oracle_) {
+        gem    = TokenLike(gem_);
+        oracle = ChronicleLike(oracle_);
+        dec    = gem.decimals();
+    }
+
+    function peek(address who) external view override returns (uint256 pie, uint256 chi, uint256 own) {
+        pie = _wad(gem.balanceOf(who), dec);
+        chi = oracle.read() * RAY / WAD;
+        own = 0;
+    }
+}
+
+interface ATokenSupplyLike is ATokenLike {
+    function totalSupply() external view returns (uint256);
+}
+
+/// The holder's share of the underlying sitting UNBORROWED in an Aave /
+/// SparkLend pool: `balanceOf / totalSupply x underlying.balanceOf(aToken)`.
+/// Not utilized by anyone, so the MSC deducts it from the Base Rate base.
+/// Tag `IDL` alongside the `ATokenPip` gem that carries the position itself.
+contract LendingIdlePip is Pip {
+    ATokenSupplyLike public immutable gem;
+    TokenLike        public immutable asset;
+    uint8            public immutable dec;
+
+    constructor(address gem_) {
+        gem   = ATokenSupplyLike(gem_);
+        asset = TokenLike(gem.UNDERLYING_ASSET_ADDRESS());
+        dec   = gem.decimals();
+    }
+
+    function peek(address who) external view override returns (uint256 pie, uint256 chi, uint256 own) {
+        uint256 supply = gem.totalSupply();
+        pie = supply == 0 ? 0 : _wad(gem.balanceOf(who) * asset.balanceOf(address(gem)) / supply, dec);
+        chi = RAY;
+        own = 0;
+    }
+}
+
+interface CurvePoolLike {
+    function coins(uint256 i) external view returns (address);
+    function balances(uint256 i) external view returns (uint256);
+}
+
+/// One leg of a Curve stableswap LP position: the holder's pro-rata share of
+/// reserve `i`, in that coin. A par leg prices at 1; a yield-bearing 4626 leg
+/// (sUSDS) prices through its vault and can carry the `SAV` tag, as the MSC
+/// does for the sUSDS slice of a pool. One pip per leg, one gem per leg.
+contract CurveLegPip is Pip {
+    CurvePoolLike public immutable pool;
+    TokenLike     public immutable lp;     // the LP token (the pool itself on stableswap-ng)
+    uint256       public immutable i;
+    TokenLike     public immutable coin;
+    uint8         public immutable dec;
+    VaultLike     public immutable vault;  // 0 for a par leg, else the leg's own 4626 vault
+    uint8         public immutable adec;
+
+    constructor(address pool_, address lp_, uint256 i_, address vault_) {
+        pool  = CurvePoolLike(pool_);
+        lp    = TokenLike(lp_);
+        i     = i_;
+        coin  = TokenLike(pool.coins(i_));
+        dec   = coin.decimals();
+        vault = VaultLike(vault_);
+        adec  = vault_ == address(0) ? dec : TokenLike(VaultLike(vault_).asset()).decimals();
+    }
+
+    function peek(address who) external view override returns (uint256 pie, uint256 chi, uint256 own) {
+        uint256 supply = TokenSupplyLike(address(lp)).totalSupply();
+        pie = supply == 0 ? 0 : _wad(lp.balanceOf(who) * pool.balances(i) / supply, dec);
+        chi = address(vault) == address(0) ? RAY : _wad(vault.convertToAssets(10 ** dec), adec) * RAY / WAD;
+        own = 0;
+    }
+}
+
+interface TokenSupplyLike {
+    function totalSupply() external view returns (uint256);
+}
+
+/// Par token whose yield is DELIVERED AS NEW TOKENS (BUIDL dividends) or as
+/// cash landing at the holder (issuer sweeps). A balance reader cannot tell
+/// a dividend from a deposit, so the party that moves capital declares it:
+/// `deal(who, wad)` BEFORE the transfer, positive for a deposit, negative for
+/// a redemption. Declared capital is kept as a share count `pie` at the
+/// implied index `chi = balance / pie`, so a declared flow leaves `chi`
+/// unchanged (no PnL) and an undeclared arrival raises it (yield).
+contract CapitalPip is Pip {
+    mapping (address => uint256) public wards;
+    function rely(address usr) external auth { wards[usr] = 1; emit Rely(usr); }
+    function deny(address usr) external auth { wards[usr] = 0; emit Deny(usr); }
+    modifier auth {
+        require(wards[msg.sender] == 1, "CapitalPip/not-authorized");
+        _;
+    }
+
+    TokenLike public immutable gem;
+    uint8     public immutable dec;
+    mapping (address => uint256) public pies;   // declared capital, in index shares [wad]
+
+    event Rely(address indexed usr);
+    event Deny(address indexed usr);
+    event Deal(address indexed who, int256 wad, uint256 pie);
+
+    constructor(address gem_) {
+        gem = TokenLike(gem_);
+        dec = gem.decimals();
+        wards[msg.sender] = 1;
+        emit Rely(msg.sender);
+    }
+
+    function _chi(address who, uint256 pie) internal view returns (uint256) {
+        uint256 bal = _wad(gem.balanceOf(who), dec);
+        return pie == 0 ? RAY : bal * RAY / pie;
+    }
+
+    /// @notice Declare a capital movement of `wad` assets (wad, signed) for
+    ///         `who`, in the same block and BEFORE the tokens move.
+    function deal(address who, int256 wad) external auth {
+        uint256 pie = pies[who];
+        uint256 chi = _chi(who, pie);
+        if (wad >= 0) pie += uint256(wad) * RAY / chi;
+        else {
+            uint256 d = uint256(-wad) * RAY / chi;
+            pie = d >= pie ? 0 : pie - d;
+        }
+        pies[who] = pie;
+        emit Deal(who, wad, pie);
+    }
+
+    function peek(address who) external view override returns (uint256 pie, uint256 chi, uint256 own) {
+        pie = pies[who];
+        chi = _chi(who, pie);
+        // Balance held with no declared capital is all yield-to-date, at par.
+        own = pie == 0 ? _wad(gem.balanceOf(who), dec) : 0;
+    }
+}

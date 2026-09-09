@@ -128,7 +128,7 @@ dchi      = sUSDS.convertToAssets(1e18) / chi_prev − 1     SSR over the interv
 br        = dchi + pad × dt / 365d                         Base Rate over the interval
 fee       = max(debt_now, debt_prev) × br                  (subsidy: min(·, line) × cut × dt/365d + rest × br)
 agentRate = min(usds_now, usds_prev) × (dchi + tip × dt/365d) + min(susds_now, susds_prev) × tip × dt/365d
-rebates   = Σ SAV: min(val_now, val_prev) × pad × dt/365d ;  Σ IDL: min(val_now, val_prev) × marginal
+rebates   = Σ SAV: min(val_now, val_prev) × pad × dt/365d ;  Σ IDL, SDE slice: min(val_now, val_prev) × marginal
 ```
 
 `file("pad"|"tip"|"cut"|"line"|"pay")` requires a drip and a poke of every
@@ -156,7 +156,7 @@ then the rule makes mistiming cost the prime, never Sky.
 | tag | routing |
 |---|---|
 | `MTM` | `gain += dpnl` |
-| `SDE` | `share = cap == 0 ? 1 : min(1, cap / prior value)`; `sde += dpnl × share`; `gain += rest`. The share is taken on the value the move was measured on, so a crash or a full redemption never routes more than Sky's slice |
+| `SDE` | `share = cap == 0 ? 1 : min(1, cap / prior value)`; `sde += dpnl × share`; `gain += rest`. The share is taken on the value the move was measured on, so a crash or a full redemption never routes more than Sky's slice. `drip` also rebates the Base Rate on Sky's slice: Sky takes its yield directly, so charging BR on it would bill twice (the MSC excludes `sde_av` from utilized) |
 | `SAV` | no PnL (SSR stays in the token); `drip` rebates `min(value, prior value) × pad × dt/365d` |
 | `IDL` | no PnL; `drip` rebates `min(value, prior value) × marginal`, where `marginal` is `cut` inside the subsidy cap and the full Base Rate above it. At settle the total rebate is bounded by `tab`: never more is handed back than was charged |
 | `NIL` | nothing booked (Savings V2 position-only) |
@@ -169,7 +169,25 @@ Adapters shipped in `src/Pips.sol`:
 | `Erc4626Pip` | `balanceOf` | `convertToAssets(1 share)` | 0 |
 | `Erc7540Pip` | `share.balanceOf + pendingRedeem + maxMint` | same | `pendingDeposit + maxWithdraw` |
 | `ATokenPip` | `scaledBalanceOf` | `pool.getReserveNormalizedIncome(asset)` | 0 |
+| `ChroniclePip` | `balanceOf` | Chronicle `read()` (the pip must be `kiss`ed) | 0 |
+| `LendingIdlePip` | `balanceOf / totalSupply × underlying.balanceOf(aToken)` | `RAY` | 0 |
+| `CurveLegPip` | `lp.balanceOf / totalSupply × balances(i)` | `RAY`, or the leg's 4626 `convertToAssets` | 0 |
+| `CapitalPip` | declared capital, as index shares | `balance / pie` | balance if nothing declared |
 | `RelayPip` | pushed by an authorised writer | pushed | pushed |
+
+`ChroniclePip` covers oracle-priced tranches (STAC; the JAAA / JTRSY fallback).
+`LendingIdlePip`, tagged `IDL`, is the MSC's "lending idle" deduction: the
+holder's share of underlying sitting unborrowed in a SparkLend / Aave pool.
+`CurveLegPip` is one gem per pool leg, so a sUSDS leg can carry `SAV`.
+
+`CapitalPip` is for yield that arrives as new tokens (BUIDL dividends) or as
+cash at the holder (issuer sweeps). A balance reader cannot tell a dividend
+from a deposit, so the party moving capital, the ALM controller or its
+relayer, calls `deal(who, ±wad)` in the same block before the transfer.
+Declared capital is kept as index shares at `chi = balance / pie`, so a
+declared flow leaves the index unchanged and an undeclared arrival raises it.
+This is the same discipline as `drip` before a draw; it is what replaces the
+pipeline's Transfer-log counterparty classification on-chain.
 
 `Erc7540Pip` follows ERC-7575: the vault has no ERC-20 surface, balances and
 decimals come from `vault.share()`. Its four in-flight states are each priced
@@ -311,7 +329,7 @@ made per chain and upgraded later without touching `Tally`.
 
 - `src/Tally.sol`: the contract above.
 - `src/Pips.sol`: the five adapters.
-- `test/Tally.t.sol`: 28 tests against mocks of Vat, AllocatorVault,
+- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 40 tests against mocks of Vat, AllocatorVault,
   AllocatorBuffer, UsdsJoin, sUSDS, ERC-4626/7540 vaults and an aToken pool,
   covering rates, index PnL, haircuts, escrow, SDE caps, SAV and IDL rebates,
   subsidy, whole-USDS settlement with carries, the negative prime share, the
@@ -344,52 +362,65 @@ ETH_RPC=<archive mainnet rpc> forge test --match-contract Fork -vv
 
 ### Osero: SparkLend spUSDS (rebasing aToken), 13M deposit mid-month
 
+Marked: spUSDS through `ATokenPip`, its unborrowed share through
+`LendingIdlePip` tagged `IDL`, idle USDS.
+
 | | Tally (daily) | pipeline (monthly) | ratio |
 |---|---:|---:|---:|
 | prime revenue | 5,557.81 | 5,557.82 | exact, to the cent |
-| Sky share | 11,333.36 | 7,005.67 | 1.618 |
+| Sky share, gross Base Rate on full debt | 11,333.36 | | |
+| lending-idle rebate | 3,785.64 | | |
+| Sky share, net | 7,547.71 | 7,005.67 | 1.077 |
 | agent rate | 31,098.68 | 31,140.91 | 0.998644 |
+
+The pipeline deducts the prime's share of USDS sitting unborrowed in the
+SparkLend pool from utilized (38% of the debt on day one). The `IDL` gem
+reproduces that deduction; the 7.7% residual on the net is the sampling rule
+on the day of the 13M draw and deposit, when debt is charged at the new
+reading and the idle share credited at the old. A relayer `drip` before the
+draw removes it.
 
 ### Grove: two ilks, 5 chains, RWA tranches, LP, cash distributions, subsidy, SDE
 
 Marked: Ethereum venues with an adapter (aTokens, Morpho vaults, syrupUSDC,
-JAAA and JTRSY through the ERC-7540 adapter, BUIDL at par, idle stables, sUSDS,
-alt-holder and escrow balances). Not marked: STAC (Chronicle NAV), Curve and
-Uniswap V3 LP, the EOA relay, AUSD incentive and Galaxy cash distributions, and
-every venue on Base, Avalanche, Plume and Monad.
+JAAA and JTRSY through the ERC-7540 adapter, STAC through `ChroniclePip`,
+BUIDL at par, idle stables, sUSDS, alt-holder and escrow balances). Not
+marked: Curve and Uniswap V3 LP, the EOA relay, AUSD incentive and Galaxy cash
+distributions, and every venue on Base, Avalanche, Plume and Monad.
 
 | | Tally (daily) | pipeline (monthly) | note |
 |---|---:|---:|---|
-| prime revenue, marked venues (E4, E6, E8) | 614,598.87 | 614,503.16 | $96 apart: E6 was fully redeemed mid-month, E4 took a 3M deposit |
-| prime revenue, all venues | 614,598.87 | 4,913,183.00 | the other 4.3M is STAC, LP, cash distributions and four other chains |
+| prime revenue, marked venues (E4, E6, E7, E8) | 1,083,873.97 | 1,083,778.26 | $96 apart: E6 fully redeemed mid-month, E4 took a 3M deposit |
+| prime revenue, all venues | 1,083,873.97 | 4,913,183.00 | the other 3.8M is LP, cash distributions and four other chains |
 | SDE revenue, JTRSY | 2,507,334.74 | 2,507,613.29 | $279: fulfilled redeems at their fixed claim vs at NAV |
-| SDE revenue, BUIDL | 0 | 2,111,592.75 | yield arrives as mints, which are flows to an index reader |
-| Sky share (BR leg) | 8,593,819.39 | 3,720,604.84 | full debt vs debt less 1.57B of SDE assets |
+| SDE revenue, BUIDL | 0 | 2,111,592.75 | yield arrives as mints; needs `CapitalPip` with declared flows |
+| Base Rate, gross on full debt | 8,593,819.39 | | 1B at the subsidised rate, the rest at BR |
+| SDE slice rebate | 4,849,390.77 | | Base Rate handed back on 1.57B of SDE assets |
+| Base Rate, net | 3,744,428.62 | 3,720,604.84 | 0.6%: sampling rule on the BUIDL redemption / debt wipe day |
 | agent rate | 78,036.49 | 78,320.96 | conversion factor plus the sampling rule on the Aug 17 payment |
 
 ### What the three runs establish
 
-- **Position accounting is exact where the data is on-chain.** Every ERC-4626,
-  ERC-7540 and aToken venue reproduces the pipeline to the cent or within a
-  day's yield on a mid-month flow, across three primes and 24 venues. The
-  aToken case is the one that produced the +$667K MSC#11 restatement
-  off-chain.
-- **The Sky share differs only by things we chose to leave off-chain**: the
-  APY→APR conversion frequency (0.998682, intended), and the utilized
-  deductions. For Osero that is the prime's share of unborrowed USDS in the
-  SparkLend pool (38% of its debt on day one); for Grove it is the 1.57B of
-  SDE assets excluded from the Base Rate base. Both are readable on-chain
-  and would be `IDL`-tagged gems if wanted: lending idle as
-  `spToken.balanceOf(alm) / totalSupply × USDS.balanceOf(spToken)`, SDE
-  exclusion as the SDE gems' own value.
-- **Two things an index reader cannot see**: yield delivered as new tokens
-  (BUIDL mints, Galaxy and Agora cash sweeps) and NAVs that live only in an
-  oracle (STAC on Chronicle). The first is a flow-classification problem
-  that needs Transfer history, so it stays hybrid; the second is a
-  `ChroniclePip` away.
-- **Cross-chain** is the largest gap for Grove (2.55M of 4.91M prime revenue
-  is on Base, Avalanche and Plume) and is the operator-relay path already
-  agreed.
+- **Position accounting is exact where the data is on-chain.** Every
+  ERC-4626, ERC-7540, aToken and oracle-priced venue reproduces the pipeline
+  to the cent or within a day's yield on a mid-month flow, across three primes
+  and 25 venues. The aToken case is the one that produced the +$667K MSC#11
+  restatement off-chain.
+- **The Sky share now matches the pipeline's utilized base.** With the
+  lending-idle gem and the SDE rebate, Osero's and Grove's net Base Rate land
+  within 8% and 0.6% of the pipeline, and the whole residual is the sampling
+  rule on days with large same-block moves. It is one-sided in Sky's favour
+  and disappears when the relayer drips before it draws or wipes.
+- **Yield delivered as new tokens** (BUIDL dividends, Galaxy and Agora cash
+  sweeps) is the one class no balance reader can recognise: a dividend and a
+  deposit look the same. `CapitalPip` recognises it once the party moving
+  capital declares its flows; until the controller does that, it stays
+  hybrid. This is the 2.1M BUIDL line.
+- **Cross-chain** is Grove's largest remaining gap (2.55M of 4.91M prime
+  revenue on Base, Avalanche and Plume) and is the operator-relay path
+  already agreed. Curve and Uniswap positions have an adapter path
+  (`CurveLegPip` is written; Uniswap V3/V4 needs the tick-math port) and
+  are small.
 
 ## 6. Decisions log
 
@@ -425,6 +456,15 @@ the drip interval. Obex backtest unchanged on the daily cadence.
 2026-09-08: `TallyJob` (dss-cron `IJob`) settles each instance once per UTC
 day; `zzz` records the last settle so relayer drips do not suppress it.
 Backtests for Osero and Grove added alongside Obex (§5).
+
+2026-09-09: four adapters after the backtests: `ChroniclePip` (STAC),
+`LendingIdlePip` (the MSC's lending-idle deduction, tagged `IDL`),
+`CurveLegPip` (one gem per pool leg), `CapitalPip` (declared capital flows
+for BUIDL-style yield). `SDE` gems now rebate the Base Rate on Sky's slice,
+matching the MSC's exclusion of `sde_av` from utilized. `IDL` gems are memo
+items and are not added to NAV. Grove's marked Ethereum revenue rises to
+1,083,874 vs 1,083,778, and both Osero's and Grove's net Base Rate now
+reconcile to the pipeline's utilized base.
 
 Open: contract name (`Tally` stands; `Till` is the short alternative); float
 sizing and top-up cadence; teaching the ALM controller to `drip` before
