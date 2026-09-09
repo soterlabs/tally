@@ -3,7 +3,7 @@ pragma solidity ^0.8.21;
 
 import { Test, console2 } from "forge-std/Test.sol";
 import { Tally } from "../src/Tally.sol";
-import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip } from "../src/Pips.sol";
+import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip, CurveLegPip, UniV3Pip } from "../src/Pips.sol";
 
 interface KissLike { function kiss(address) external; }
 
@@ -73,6 +73,16 @@ abstract contract ForkBase is Test {
     function _idle(Tally t, address aToken) internal {
         LendingIdlePip p = new LendingIdlePip(aToken); vm.makePersistent(address(p));
         t.init(address(uint160(aToken) + 1), address(p), t.IDL());
+    }
+    function _curve(Tally t, address pool, uint256 i, uint8 tag) internal {
+        CurveLegPip p = new CurveLegPip(pool, pool, i, address(0)); vm.makePersistent(address(p));
+        t.init(address(uint160(pool) + 1 + uint160(i)), address(p), tag);
+    }
+    function _univ3(Tally t, address npm, address pool, address who, uint8 tag) internal returns (UniV3Pip p) {
+        p = new UniV3Pip(npm, pool); vm.makePersistent(address(p));
+        address key = address(uint160(pool) + uint160(who) % 7);
+        t.init(key, address(p), tag);
+        if (who != t.alm()) { t.poke(key); t.file(key, "who", who); }
     }
     function _chronicle(Tally t, address gem, address oracle, uint8 tag) internal returns (ChroniclePip p) {
         p = new ChroniclePip(gem, oracle); vm.makePersistent(address(p));
@@ -233,6 +243,9 @@ contract GroveForkTest is ForkBase {
     address constant AUSD        = 0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a;
     address constant PYUSD       = 0x6c3ea9036406852006290770BEdFcAbA0e23A0e8;
     address constant STAC        = 0x51C2d74017390CbBd30550179A16A1c28F7210fc;
+    address constant CURVE_AUSD  = 0xE79C1C7E24755574438A26D5e062Ad2626C04662;   // AUSD/USDC stableswap-ng
+    address constant UNI_NPM     = 0xC36442b4a4522E871399CD717aBDD847Ab11FE88;
+    address constant UNI_POOL    = 0xbAFeAd7c60Ea473758ED6c6021505E8BBd7e8E5d;   // AUSD/USDC 0.01%
     address constant STAC_ORACLE = 0x802CaCc19B9b3eb474C7DEf6f28c64AB67fb0753;   // Chronicle
     address constant CHRONICLE_AUTHED = 0x62a69d7832040Cd629Ee2f712b4C8639C0F905D7;
     ChroniclePip stacPip;
@@ -265,9 +278,8 @@ contract GroveForkTest is ForkBase {
         bloom.file("cut", 0.036613e27);
         bloom.file("line", 1_000_000_000e18);
 
-        // Ethereum venues with an on-chain adapter. Not marked: Curve / Uniswap
-        // V3 LP, the EOA relay, cash distributions, and everything on Base,
-        // Avalanche, Plume, Monad.
+        // Ethereum venues with an on-chain adapter. Not marked: the EOA relay,
+        // cash distributions, and everything on Base, Avalanche, Plume, Monad.
         _atoken(bloom, A_RLUSD_HOR, bloom.MTM());
         _atoken(bloom, A_USDC_HOR,  bloom.MTM());
         _atoken(bloom, A_RLUSD,     bloom.MTM());
@@ -289,6 +301,10 @@ contract GroveForkTest is ForkBase {
         _raw(bloom, PYUSD, bloom.MTM());
         _raw(bloom, USDS,  bloom.MTM());
         _v4626(bloom, SUSDS, bloom.SAV());
+        _curve(bloom, CURVE_AUSD, 0, bloom.MTM());      // USDC leg
+        _curve(bloom, CURVE_AUSD, 1, bloom.MTM());      // AUSD leg
+        _univ3(bloom, UNI_NPM, UNI_POOL, ALM, bloom.MTM());
+        _univ3(bloom, UNI_NPM, UNI_POOL, ALT, bloom.MTM());
         // Same tokens at other holders: distinct keys, holder override.
         _raw(bloom, address(uint160(AUSD) + 1), AUSD, bloom.MTM(), ALT);
         _raw(bloom, address(uint160(USDC) + 1), USDC, bloom.MTM(), ALT);
@@ -298,6 +314,7 @@ contract GroveForkTest is ForkBase {
 
     // Pipeline per-venue revenue for the venues marked above (settlements/grove/2026-08).
     uint256 constant PIPE_MARKED   = 7322.92e18 + 36533.48e18 + 570646.76e18 + 469275.10e18;   // Steakhouse USDC, Steakhouse AUSD, JAAA, STAC
+    int256  constant PIPE_LP       = 165.29e18 - 49708.11e18;                                    // Curve E11, Uniswap V3 E12
     uint256 constant PIPE_COF      = 3720604.844326282036275795e18;   // subsidy_summary.actual_cof: BR on utilized
     uint256 constant PIPE_E9       = 2507613.29e18;                              // JTRSY (SDE)
 
@@ -306,10 +323,14 @@ contract GroveForkTest is ForkBase {
         _run(ts, "grove");
         (uint256 tab, int256 gain, int256 sde, uint256 owe, uint256 rebate) = _report(ts, PIPE_SKY, PIPE_PRIME, PIPE_SDE, PIPE_AGENT);
 
-        // Prime revenue of the marked Ethereum venues: within $150 of the
-        // pipeline's sum for the same four venues (E6 was fully redeemed
-        // mid-month, E4 took a 3M deposit, STAC through Chronicle).
-        assertApproxEqAbs(uint256(gain), PIPE_MARKED, 150e18);
+        // Prime revenue of the marked Ethereum venues (Steakhouse USDC and
+        // AUSD, JAAA, STAC, Curve AUSD/USDC, Uniswap V3 AUSD/USDC): within
+        // $500 of the pipeline's sum for the same six venues. The LP legs
+        // alone are -49,861 vs -49,543: the pipeline figure predates its
+        // fee-collection credit (the Aug 17 collect of ~61.6k reads as a
+        // loss to both until declared with UniV3Pip.deal).
+        assertApproxEqAbs(gain, int256(PIPE_MARKED) + PIPE_LP, 500e18);
+        console2.log("LP venues: Tally %s vs pipeline -49,542.82 (cents, signed below)", uint256(-(gain - int256(PIPE_MARKED))) / 1e16);
         // Net Base Rate: full debt at cut/BR less the SDE slice's rebate ==
         // the pipeline's utilized (debt - sde_av) at the same tiers. The 0.6%
         // residual is the sampling rule on the day BUIDL was redeemed (75M)

@@ -171,14 +171,25 @@ Adapters shipped in `src/Pips.sol`:
 | `ATokenPip` | `scaledBalanceOf` | `pool.getReserveNormalizedIncome(asset)` | 0 |
 | `ChroniclePip` | `balanceOf` | Chronicle `read()` (the pip must be `kiss`ed) | 0 |
 | `LendingIdlePip` | `balanceOf / totalSupply × underlying.balanceOf(aToken)` | `RAY` | 0 |
-| `CurveLegPip` | `lp.balanceOf / totalSupply × balances(i)` | `RAY`, or the leg's 4626 `convertToAssets` | 0 |
+| `CurveLegPip` | `lp.balanceOf` | `balances(i) / totalSupply`, times the leg's 4626 price if yield-bearing | 0 |
+| `UniV3Pip` | Σ positions' notional at parity | value (amounts + owed + accrued + declared collected fees) per unit of notional | residue when no liquidity |
 | `CapitalPip` | declared capital, as index shares | `balance / pie` | balance if nothing declared |
 | `RelayPip` | pushed by an authorised writer | pushed | pushed |
 
 `ChroniclePip` covers oracle-priced tranches (STAC; the JAAA / JTRSY fallback).
 `LendingIdlePip`, tagged `IDL`, is the MSC's "lending idle" deduction: the
 holder's share of underlying sitting unborrowed in a SparkLend / Aave pool.
-`CurveLegPip` is one gem per pool leg, so a sUSDS leg can carry `SAV`.
+`CurveLegPip` is one gem per pool leg with the LP token as the share, so
+swap fees accruing to the reserves read as yield and a sUSDS leg can carry
+`SAV`. `UniV3Pip` enumerates the holder's NFTs in one pool and values them
+at par: amounts at the current price, fees owed, fees accrued since the last
+touch, and fees already collected. Raw liquidity is not a valid share unit
+across positions (a wider tick range holds far more value per unit of
+liquidity: the ALM's 4M add on Aug 20 raised liquidity 1.6% and value 16%),
+so the share is each position's notional at parity, the amounts it would
+hold with the price exactly at 1. A fee collect moves value out of the
+position and reads as a loss until the relayer declares it with `deal`, the
+same discipline as `CapitalPip`.
 
 `CapitalPip` is for yield that arrives as new tokens (BUIDL dividends) or as
 cash at the holder (issuer sweeps). A balance reader cannot tell a dividend
@@ -329,7 +340,7 @@ made per chain and upgraded later without touching `Tally`.
 
 - `src/Tally.sol`: the contract above.
 - `src/Pips.sol`: the five adapters.
-- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 40 tests against mocks of Vat, AllocatorVault,
+- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 41 tests against mocks of Vat, AllocatorVault,
   AllocatorBuffer, UsdsJoin, sUSDS, ERC-4626/7540 vaults and an aToken pool,
   covering rates, index PnL, haircuts, escrow, SDE caps, SAV and IDL rebates,
   subsidy, whole-USDS settlement with carries, the negative prime share, the
@@ -385,14 +396,16 @@ each draw removes it, and the error is one-sided in Sky's favour.
 
 Marked: Ethereum venues with an adapter (aTokens, Morpho vaults, syrupUSDC,
 JAAA and JTRSY through the ERC-7540 adapter, STAC through `ChroniclePip`,
-BUIDL at par, idle stables, sUSDS, alt-holder and escrow balances). Not
-marked: Curve and Uniswap V3 LP, the EOA relay, AUSD incentive and Galaxy cash
+Curve AUSD/USDC through two `CurveLegPip`s, Uniswap V3 AUSD/USDC through
+`UniV3Pip`, BUIDL at par, idle stables, sUSDS, alt-holder and escrow
+balances). Not marked: the EOA relay, AUSD incentive and Galaxy cash
 distributions, and every venue on Base, Avalanche, Plume and Monad.
 
 | | Tally (daily) | pipeline (monthly) | note |
 |---|---:|---:|---|
-| prime revenue, marked venues (E4, E6, E7, E8) | 1,083,873.97 | 1,083,778.26 | $96 apart: E6 fully redeemed mid-month, E4 took a 3M deposit |
-| prime revenue, all venues | 1,083,873.97 | 4,913,183.00 | the other 3.8M is LP, cash distributions and four other chains |
+| prime revenue, marked venues (E4, E6, E7, E8, E11, E12) | 1,033,916.91 | 1,034,235.44 | $319 apart |
+| of which LP (Curve E11 + Uniswap V3 E12) | −49,861.34 | −49,542.82 | pipeline figure predates its fee-collection credit; the Aug 17 collect (~61.6k) reads as a loss to both until declared |
+| prime revenue, all venues | 1,033,916.91 | 4,913,183.00 | the other 3.9M is cash distributions and four other chains |
 | SDE revenue, JTRSY | 2,507,334.74 | 2,507,613.29 | $279: fulfilled redeems at their fixed claim vs at NAV |
 | SDE revenue, BUIDL | 0 | 2,111,592.75 | yield arrives as mints; needs `CapitalPip` with declared flows |
 | Base Rate, gross on full debt | 8,593,819.39 | | 1B at the subsidised rate, the rest at BR |
@@ -419,9 +432,8 @@ distributions, and every venue on Base, Avalanche, Plume and Monad.
   hybrid. This is the 2.1M BUIDL line.
 - **Cross-chain** is Grove's largest remaining gap (2.55M of 4.91M prime
   revenue on Base, Avalanche and Plume) and is the operator-relay path
-  already agreed. Curve and Uniswap positions have an adapter path
-  (`CurveLegPip` is written; Uniswap V3/V4 needs the tick-math port) and
-  are small.
+  already agreed. Curve and Uniswap V3 positions now reconcile on-chain;
+  Uniswap V4 (Spark) needs the same adapter against the V4 PositionManager.
 
 ## 6. Decisions log
 
@@ -457,6 +469,10 @@ the drip interval. Obex backtest unchanged on the daily cadence.
 2026-09-08: `TallyJob` (dss-cron `IJob`) settles each instance once per UTC
 day; `zzz` records the last settle so relayer drips do not suppress it.
 Backtests for Osero and Grove added alongside Obex (§5).
+
+2026-09-09, later: `CurveLegPip` reworked (LP token as share) and wired into
+Grove; `UniV3Pip` written (notional-at-parity shares, declared fee collects)
+and wired. Grove's marked Ethereum revenue: 1,033,917 vs 1,034,235.
 
 2026-09-09: four adapters after the backtests: `ChroniclePip` (STAC),
 `LendingIdlePip` (the MSC's lending-idle deduction, tagged `IDL`),

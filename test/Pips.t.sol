@@ -2,7 +2,7 @@
 pragma solidity ^0.8.21;
 
 import { Test } from "forge-std/Test.sol";
-import { ChroniclePip, LendingIdlePip, CurveLegPip, CapitalPip } from "../src/Pips.sol";
+import { ChroniclePip, LendingIdlePip, CurveLegPip, CapitalPip, UniV3Pip } from "../src/Pips.sol";
 import { MockToken, MockVault, MockAToken, MockPool } from "./Tally.t.sol";
 
 contract MockChronicle {
@@ -26,6 +26,13 @@ contract MockATokenSupply is MockAToken {
     uint256 public totalSupply;
     constructor(address pool, address asset, uint8 dec) MockAToken(pool, asset, dec) {}
     function setSupply(uint256 s) external { totalSupply = s; }
+}
+
+// Exposes UniV3Pip's pure math without a pool.
+contract UniV3Math is UniV3Pip {
+    constructor() UniV3Pip(address(0), address(0)) {}
+    function sqrtAtTick(int24 t) external pure returns (uint160) { return _sqrtAtTick(t); }
+    function amounts(uint160 sp, uint160 sa, uint160 sb, uint128 L) external pure returns (uint256, uint256) { return _amounts(sp, sa, sb, L); }
 }
 
 contract PipsTest is Test {
@@ -65,11 +72,22 @@ contract PipsTest is Test {
         pool.mint(alm, 100e18);
         CurveLegPip p0 = new CurveLegPip(address(pool), address(pool), 0, address(0));
         CurveLegPip p1 = new CurveLegPip(address(pool), address(pool), 1, address(0));
-        (uint256 pie0,,) = p0.peek(alm);
-        (uint256 pie1,,) = p1.peek(alm);
+        (uint256 pie0, uint256 chi0,) = p0.peek(alm);
+        (uint256 pie1, uint256 chi1,) = p1.peek(alm);
+        assertEq(pie0, 100e18); assertEq(pie1, 100e18);
         // 100 / 301.5479 of each reserve
-        assertApproxEqAbs(pie0, 50.6031e18, 1e14);
-        assertApproxEqAbs(pie1, 49.4565e18, 1e14);
+        assertApproxEqAbs(pie0 * chi0 / RAY, 50.6031e18, 1e14);
+        assertApproxEqAbs(pie1 * chi1 / RAY, 49.4565e18, 1e14);
+
+        // Fees accrue to the reserves: LP balance unchanged, index up -> yield.
+        pool.set(152_592_396 + 1_000_000, 149_134_767, 301.547852644914548578e18);
+        (, uint256 chi0b,) = p0.peek(alm);
+        assertGt(chi0b, chi0);
+        // A new LP mint at the same reserves per LP: pie up, index unchanged -> flow.
+        pool.set((152_592_396 + 1_000_000) * 2, 149_134_767 * 2, 2 * 301.547852644914548578e18);
+        pool.mint(alm, 100e18);
+        (uint256 pie0c, uint256 chi0c,) = p0.peek(alm);
+        assertEq(pie0c, 200e18); assertEq(chi0c, chi0b);
     }
 
     function test_curve_yield_leg_prices_through_vault() public {
@@ -81,8 +99,8 @@ contract PipsTest is Test {
         pool.mint(alm, 1_000e18);
         CurveLegPip leg = new CurveLegPip(address(pool), address(pool), 0, address(susds));
         (uint256 pie, uint256 chi,) = leg.peek(alm);
-        assertEq(pie, 500e18);
-        assertEq(chi, 1.05e27);
+        assertEq(pie, 1_000e18);
+        assertEq(pie * chi / RAY, 525e18);   // half of 1,000 sUSDS at 1.05
     }
 
     function test_capital_pip_declared_flows_are_not_yield() public {
@@ -124,6 +142,28 @@ contract PipsTest is Test {
         buidl.mint(address(0xB2), 5e6);
         (pie, chi, own) = fresh.peek(address(0xB2));
         assertEq(pie, 0); assertEq(own, 5e18);
+    }
+
+    function test_univ3_math() public {
+        // A pool address of 0 makes the constructor's reads fail; etch nothing, use vm.mockCall.
+        vm.mockCall(address(0), abi.encodeWithSignature("token0()"), abi.encode(address(1)));
+        vm.mockCall(address(0), abi.encodeWithSignature("token1()"), abi.encode(address(2)));
+        vm.mockCall(address(0), abi.encodeWithSignature("fee()"), abi.encode(uint24(100)));
+        vm.mockCall(address(1), abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
+        vm.mockCall(address(2), abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
+        UniV3Math m = new UniV3Math();
+        uint160 q96 = uint160(2 ** 96);
+        assertEq(m.sqrtAtTick(0), q96);
+        assertLt(m.sqrtAtTick(-1), q96); assertGt(m.sqrtAtTick(1), q96);
+        // Grove E12 on Aug 1: L = 2.5e17 in [-1, 1] at price ~1 -> ~25.0M of 6-dec tokens.
+        (uint256 a0, uint256 a1) = m.amounts(q96, m.sqrtAtTick(-1), m.sqrtAtTick(1), 250012499687515624);
+        assertApproxEqRel(a0 + a1, 25_000_000e6, 1e15);
+        assertApproxEqRel(a0, a1, 1e12);   // symmetric at parity
+        // Out of range below: all token0; above: all token1.
+        (a0, a1) = m.amounts(m.sqrtAtTick(-5), m.sqrtAtTick(-1), m.sqrtAtTick(1), 250012499687515624);
+        assertEq(a1, 0); assertApproxEqRel(a0, 25_000_000e6, 1e13);
+        (a0, a1) = m.amounts(m.sqrtAtTick(5), m.sqrtAtTick(-1), m.sqrtAtTick(1), 250012499687515624);
+        assertEq(a0, 0); assertApproxEqRel(a1, 25_000_000e6, 1e13);
     }
 
     function test_capital_pip_auth() public {
