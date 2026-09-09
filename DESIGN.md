@@ -368,17 +368,18 @@ Marked: spUSDS through `ATokenPip`, its unborrowed share through
 | | Tally (daily) | pipeline (monthly) | ratio |
 |---|---:|---:|---:|
 | prime revenue | 5,557.81 | 5,557.82 | exact, to the cent |
-| Sky share, gross Base Rate on full debt | 11,333.36 | | |
-| lending-idle rebate | 3,785.64 | | |
+| Sky share, gross Base Rate on full debt | 11,333.36 | 11,348.31 (`daily_sky_rev_gross`) | 0.998683 |
+| lending-idle deduction | 3,785.64 | 4,342.64 (gross − net) | 0.872 |
 | Sky share, net | 7,547.71 | 7,005.67 | 1.077 |
 | agent rate | 31,098.68 | 31,140.91 | 0.998644 |
 
 The pipeline deducts the prime's share of USDS sitting unborrowed in the
-SparkLend pool from utilized (38% of the debt on day one). The `IDL` gem
-reproduces that deduction; the 7.7% residual on the net is the sampling rule
-on the day of the 13M draw and deposit, when debt is charged at the new
-reading and the idle share credited at the old. A relayer `drip` before the
-draw removes it.
+SparkLend pool from utilized (38% of the debt on day one). The gross charge
+matches to the conversion factor. The deduction is 13% short because the
+debt was drawn in steps (1M → 3M on Aug 17, 4M on Aug 18, … 14M) and on each
+step day the sampling rule charges the new debt while crediting the old idle
+share; the pipeline includes both from the same day. A relayer `drip` before
+each draw removes it, and the error is one-sided in Sky's favour.
 
 ### Grove: two ilks, 5 chains, RWA tranches, LP, cash distributions, subsidy, SDE
 
