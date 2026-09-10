@@ -115,6 +115,8 @@ gems and `debt = 0` still pays their agent rate through `drip` + `settle`.
 | `owe` | demand side owed to the prime since last settle | — |
 | `gain` / `sde` / `rebate` | prime MTM / Sky-direct MTM / rebates (sUSDS spread, idle BR) | — |
 | `sin` | negative prime share carried forward | Vat / Vow |
+| `flux` / `capital` / `gap` | Σ gem flows / Σ debt changes less own draws / their difference, unrouted | — |
+| `route` / `sort` | default bucket for `gap` / attribute part of it | — |
 | `vow` | the surplus buffer | Vow |
 | `drip` / `poke` / `settle` / `gift` | accrue / mark / execute / credit off-chain DV | Jug / Spot / — / — |
 | `init` / `file` / `rely` / `deny` / `cage` / `live` | admin | everywhere |
@@ -214,7 +216,39 @@ chain (L2 ALM Proxies, PSM3 baskets, custodial NAVs): a bridge receiver, an
 oracle, or the hybrid process pokes it. Curve and Uniswap LP decomposition
 would be further pips; nothing in `Tally` changes.
 
-### 2.4 Settlement
+### 2.4 Equity layer: recognition on top of attribution
+
+The index method above is an attribution engine: it knows which venue earned
+what, and treats every balance change as a flow. It is therefore blind to
+yield that arrives as new tokens or cash (BUIDL dividends, issuer sweeps). The
+equity method reads the same gems the other way:
+
+```
+Σ Δvalue = Σ index PnL + Σ flows                        per poke: flow = Δvalue − dpnl
+flux     = Σ flows over the interval                    (IDL and NIL gems excluded)
+capital  = Σ Δdebt over the interval − Tally's own draws
+gap      = flux − capital
+```
+
+A draw or a wipe appears in both `flux` and `capital` and cancels; a move
+between two gems cancels inside `flux`. What survives in `gap` is value that
+entered the perimeter without a debt increase (a dividend, a sweep) or left it
+without a debt decrease (a bridge, a transfer out). Nothing new is read: the
+perimeter is the set of gems, so adding a chain is adding `RelayPip` gems and
+a bridge then cancels between the two sides.
+
+`gap` is published in the `Gap` event at every settle and routed by a filed
+`route`: `MTM` books it as prime revenue, `SDE` as Sky's, `NIL` reports and
+carries it. `sort(wad, to)` lets the operator attribute part of it (BUIDL
+dividends to `SDE`) before the default takes the rest. With `route = MTM` the
+settled total equals the equity delta exactly, and the index method's
+flow-timing approximation (one day's yield on a mid-interval flow) is
+absorbed rather than lost. `route` should be `NIL` for a prime whose
+perimeter is still open (Spark, Grove until the L2 relays land) and `MTM` for
+one whose perimeter is closed (Obex, Osero), where a non-zero `gap` is a
+leak or an unpriced venue and a zero `gap` is a daily correctness check.
+
+### 2.5 Settlement
 
 `settle()` is permissionless. It drips, pokes every gem, then:
 
@@ -257,7 +291,7 @@ draw is capped at whatever headroom exists and the remainder carries on the
 Sky side, so a prime at its AutoLine cap still gets its demand side paid and
 Sky's charge keeps accruing instead of the whole cycle reverting.
 
-### 2.5 Permissions
+### 2.6 Permissions
 
 `Tally` needs the prime-scoped roles the ALM controller already holds:
 `AllocatorVault.draw` for its ilk and a USDS allowance from the
@@ -268,7 +302,7 @@ holds no Vat authority. Governance holds `Tally.wards` for `init`, `file`,
 hybrid process needs `gift` and `RelayPip.poke` only. `drip`, `poke`,
 `settle` are open.
 
-### 2.6 A moving `rate` on allocator ilks (not taken, for the record)
+### 2.7 A moving `rate` on allocator ilks (not taken, for the record)
 
 The alternative to `draw` was `vat.fold(ilk, vow, mint / Art)`, the Jug's
 own path. Its merits: interest is capitalised the way every other ilk does
@@ -279,7 +313,7 @@ is that `Tally` becomes a Vat ward, the highest privilege in the system, for
 a keeper-triggered daily contract. Decision: `draw` via the allocator stack;
 the frozen-rate convention is not load-bearing and could be revisited.
 
-### 2.7 Operations: `TallyJob`
+### 2.8 Operations: `TallyJob`
 
 `src/TallyJob.sol` is a dss-cron job for Sky's keeper networks. It holds the
 list of `Tally` instances and implements `IJob`:
@@ -340,7 +374,7 @@ made per chain and upgraded later without touching `Tally`.
 
 - `src/Tally.sol`: the contract above.
 - `src/Pips.sol`: the five adapters.
-- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 41 tests against mocks of Vat, AllocatorVault,
+- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 46 tests against mocks of Vat, AllocatorVault,
   AllocatorBuffer, UsdsJoin, sUSDS, ERC-4626/7540 vaults and an aToken pool,
   covering rates, index PnL, haircuts, escrow, SDE caps, SAV and IDL rebates,
   subsidy, whole-USDS settlement with carries, the negative prime share, the
@@ -413,26 +447,37 @@ distributions, and every venue on Base, Avalanche, Plume and Monad.
 | Base Rate, net | 3,744,428.62 | 3,720,604.84 | 0.6%: sampling rule on the BUIDL redemption / debt wipe day |
 | agent rate | 78,036.49 | 78,320.96 | conversion factor plus the sampling rule on the Aug 17 payment |
 
+### The equity gap on the three runs
+
+| prime | `gap` for August | what it is |
+|---|---:|---|
+| Obex | −2,535,968 | exactly the MSC#11 capitalisation: 2,535,968 of new ilk debt on Aug 17 whose USDS went to Sky's surplus buffer, not the ALM. In the DSC that is Tally's own draw and is excluded; in the historical run it is the one debt change that funded nothing |
+| Osero | −262 | debt rose 13,001,497 while 13,001,234.84 reached SparkLend (the pipeline's `period_inflow`): the residue of the July capitalisation and draw rounding |
+| Grove | −13,064,716 | an open perimeter: Curve, AUSD and BUIDL redemptions bridged to other chains, the July capitalisation, and +3.4M of BUIDL dividends and cash sweeps that the index layer cannot see. `route` must stay `NIL` until Base, Avalanche and Plume are relayed in |
+
+For the two closed perimeters the gap is the settlement mechanics themselves
+and nothing else, which is the daily invariant the equity layer is for. For
+Grove it is the size of what is still off-chain.
+
 ### What the three runs establish
 
 - **Position accounting is exact where the data is on-chain.** Every
-  ERC-4626, ERC-7540, aToken and oracle-priced venue reproduces the pipeline
-  to the cent or within a day's yield on a mid-month flow, across three primes
-  and 25 venues. The aToken case is the one that produced the +$667K MSC#11
-  restatement off-chain.
-- **The Sky share now matches the pipeline's utilized base.** With the
+  ERC-4626, ERC-7540, aToken, oracle-priced, Curve and Uniswap V3 venue
+  reproduces the pipeline to the cent or within a day's yield on a mid-month
+  flow, across three primes and 27 venues. The aToken case is the one that
+  produced the +$667K MSC#11 restatement off-chain.
+- **The Sky share matches the pipeline's utilized base.** With the
   lending-idle gem and the SDE rebate, Osero's and Grove's net Base Rate land
   within 8% and 0.6% of the pipeline, and the whole residual is the sampling
   rule on days with large same-block moves. It is one-sided in Sky's favour
   and disappears when the relayer drips before it draws or wipes.
-- **Yield delivered as new tokens** (BUIDL dividends, Galaxy and Agora cash
-  sweeps) is the one class no balance reader can recognise: a dividend and a
-  deposit look the same. `CapitalPip` recognises it once the party moving
-  capital declares its flows; until the controller does that, it stays
-  hybrid. This is the 2.1M BUIDL line.
+- **Yield delivered as new tokens or cash** (BUIDL dividends, Galaxy and
+  Agora sweeps) is invisible to the index layer and visible to the equity
+  layer as `gap`, once the perimeter is closed. Attribution between Sky and
+  the prime still needs `sort` or `CapitalPip`.
 - **Cross-chain** is Grove's largest remaining gap (2.55M of 4.91M prime
   revenue on Base, Avalanche and Plume) and is the operator-relay path
-  already agreed. Curve and Uniswap V3 positions now reconcile on-chain;
+  already agreed; it is also what closes the perimeter for the equity layer.
   Uniswap V4 (Spark) needs the same adapter against the V4 PositionManager.
 
 ## 6. Decisions log
@@ -469,6 +514,11 @@ the drip interval. Obex backtest unchanged on the daily cadence.
 2026-09-08: `TallyJob` (dss-cron `IJob`) settles each instance once per UTC
 day; `zzz` records the last settle so relayer drips do not suppress it.
 Backtests for Osero and Grove added alongside Obex (§5).
+
+2026-09-10: equity layer added: `flux`, `capital`, `gap`, `route`, `sort`.
+Recognition of unlabelled arrivals (dividends, sweeps) without sender labels;
+attribution stays with the index tags and `sort`. `CapitalPip` is kept as an
+optional attribution aid.
 
 2026-09-09, later: `CurveLegPip` reworked (LP token as share) and wired into
 Grove; `UniV3Pip` written (notional-at-parity shares, declared fee collects)

@@ -166,6 +166,12 @@ contract Tally {
     uint256 public cut;      // subsidised Base Rate, annual nominal               [ray]
     uint256 public line;     // debt charged at `cut` (subsidy cap), 0 = no subsidy [wad]
 
+    // Equity layer: recognition of value that entered or left without a debt change
+    int256  public flux;     // Σ gem flows since last settle: Δvalue − index PnL        [wad]
+    int256  public capital;  // Σ debt changes since last settle, less Tally's own draws [wad]
+    int256  public gap;      // flux − capital, unrouted                                 [wad]
+    uint8   public route;    // where a day's gap goes: MTM, SDE, or NIL = report and carry
+
     // Book: accruals since the last settle and carries
     uint256 public tab;      // Base Rate charge                                    [wad]
     uint256 public owe;      // demand side owed to the prime (agent rate, gifts, unpaid send) [wad]
@@ -204,6 +210,8 @@ contract Tally {
     event Poke(address indexed gem, uint256 pie, uint256 chi, uint256 own, uint256 val, int256 dpnl);
     event Gift(uint256 wad);
     event Settle(int256 sky, int256 sv, uint256 dv, uint256 mint, uint256 drew, uint256 send, uint256 paid, uint256 kept);
+    event Gap(int256 flux, int256 capital, int256 gap, uint8 route);
+    event Sort(int256 wad, uint8 to);
     event Quit(address indexed gem, address indexed dst, uint256 wad);
     event Cage();
 
@@ -216,6 +224,7 @@ contract Tally {
         usds  = GemLike(usds_);
         susds = SusdsLike(susds_);
         live  = 1;
+        route = NIL;
         rho   = block.timestamp;
         chi   = susds.convertToAssets(WAD);
         art   = debt();
@@ -280,6 +289,7 @@ contract Tally {
         else if (what == "cut")  cut  = data;
         else if (what == "line") line = data;
         else if (what == "pay")  { require(data <= 1, "Tally/bad-flag"); pay = data; }
+        else if (what == "route") { require(data == MTM || data == SDE || data == NIL, "Tally/bad-route"); route = uint8(data); }
         else revert("Tally/file-unrecognized-param");
         emit File(what, data);
     }
@@ -337,6 +347,18 @@ contract Tally {
         require(pay == 1, "Tally/not-paying");
         owe += wad;
         emit Gift(wad);
+    }
+
+    /// @notice Attribute `wad` of the unrouted gap to a bucket: MTM (prime) or
+    ///         SDE (Sky). The equity layer recognises unlabelled arrivals; this
+    ///         is how the operator says whose they are (e.g. BUIDL dividends
+    ///         to Sky). Signed, so a mis-sort can be undone.
+    function sort(int256 wad, uint8 to) external auth {
+        require(live == 1, "Tally/not-live");
+        require(to == MTM || to == SDE, "Tally/bad-bucket");
+        gap -= wad;
+        if (to == MTM) gain += wad; else sde += wad;
+        emit Sort(wad, to);
     }
 
     /// @notice Move tokens out (the USDS float, a mistaken transfer). Works
@@ -428,6 +450,7 @@ contract Tally {
             emit Drip(d, dchi, fee, ar, rb);
         }
 
+        capital += int256(d) - int256(art);
         chi = c;
         art = d;
         usd = u;
@@ -470,6 +493,10 @@ contract Tally {
 
         // PnL on the shares carried through the interval, at the new index.
         int256 dpnl = int256(_rmul(g.pie, chi_)) - int256(_rmul(g.pie, g.chi));
+
+        // Equity layer: what moved in or out of this holding. IDL gems are memo
+        // items inside other holdings and NIL gems are outside the scope.
+        if (g.tag != IDL && g.tag != NIL) flux += int256(val) - int256(was) - dpnl;
 
         if (g.tag == MTM) {
             gain += dpnl;
@@ -521,6 +548,15 @@ contract Tally {
 
         Day memory d;
 
+        // Equity layer: value that entered without a debt increase, or left
+        // without a debt decrease, since the last settle. Routed by `route`;
+        // NIL reports and carries it.
+        emit Gap(flux, capital, gap + flux - capital, route);
+        gap += flux - capital;
+        flux = 0; capital = 0;
+        if (route == MTM) { gain += gap; gap = 0; }
+        else if (route == SDE) { sde += gap; gap = 0; }
+
         // A rebate hands back Base Rate that was charged; never more.
         uint256 rb = _min(rebate, tab);
 
@@ -570,6 +606,7 @@ contract Tally {
         if (drew > 0) {
             VaultLike(vault).draw(drew);
             require(usds.transferFrom(buffer, address(this), drew), "Tally/transfer-failed");
+            capital -= int256(drew);   // this debt did not fund the ALM
         }
     }
 

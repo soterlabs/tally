@@ -230,6 +230,8 @@ contract TallyTest is Test {
     function _debt(uint256 wad) internal { vat.set(ILK, wad, RAY); tally.drip(); }
     // Fund the SubProxy and sample it.
     function _fund(uint256 wad) internal { usds.mint(sub, wad); tally.drip(); }
+    // Borrow: debt up AND the drawn USDS lands at the ALM (what a real draw does).
+    function _borrow(uint256 wad) internal { vat.set(ILK, wad, RAY); usds.mint(alm, wad); tally.drip(); }
 
     // --- pricing ---
 
@@ -487,6 +489,78 @@ contract TallyTest is Test {
         tally.file("pad", 1);
         tally.poke();
         tally.file("pad", 1);
+    }
+
+    // --- equity layer ---
+
+    function test_gap_is_zero_for_internal_moves_and_draws() public {
+        _borrow(1_000_000_000e18);
+        vm.warp(block.timestamp + 1 days);
+        // Draw 10M into the ALM as USDS, swap 5M USDC into sUSDC shares, price moves: all internal.
+        vat.set(ILK, 1_010_000_000e18, RAY); usds.mint(alm, 10_000_000e18);
+        usdc.slash(alm, 5_000e6); sUsdc.mint(alm, 4_761_904_761);   // 5,000 USDC at 1.05
+        sUsdc.setPps(1_060_000);
+        tally.settle();
+        // Draw and swap cancel exactly. What is left is the index method's
+        // flow-timing approximation: the 4,761.9 shares that arrived mid-interval
+        // earned 0.01 each, which the index booked as a flow and equity sees as
+        // an arrival: 47.62. With route = MTM this lands in the prime's revenue,
+        // so the combined total equals the equity delta exactly.
+        assertApproxEqAbs(tally.gap(), 47.62e18, 0.01e18);
+    }
+
+    function test_index_pnl_plus_gap_equals_equity_delta() public {
+        _borrow(1_000_000_000e18);
+        tally.poke();
+        uint256 nav0 = tally.nav() - tally.value(address(susds));   // sUSDS accrues SSR on its own; keep it out
+        vm.warp(block.timestamp + 1 days);
+        usdc.slash(alm, 5_000e6); sUsdc.mint(alm, 4_761_904_761);   // swap 5,000 USDC into sUSDC at 1.05
+        sUsdc.setPps(1_060_000);                                    // then +1%
+        tally.drip(); tally.poke();
+        uint256 nav1 = tally.nav() - tally.value(address(susds));
+        // ΔNAV = -5,000 + 5,047.62 + 1,000 = 1,047.62 = index PnL (1,000) + gap (47.62)
+        assertApproxEqAbs(nav1 - nav0, 1_047.62e18, 0.01e18);
+        assertEq(tally.gain() + tally.flux() - tally.capital(), int256(nav1) - int256(nav0));
+    }
+
+    function test_gap_recognises_unlabelled_arrivals_and_leaks() public {
+        _borrow(1_000_000e18);
+        vm.warp(block.timestamp + 1 days);
+        usdc.mint(alm, 2_100e6);             // a dividend or a sweep: nobody drew for it
+        tally.settle();
+        assertApproxEqAbs(tally.gap(), 2_100e18, 1e12);   // route = NIL: reported, carried
+
+        vm.warp(block.timestamp + 1 days);
+        usdc.slash(alm, 500e6);              // bridged out: left without a wipe
+        tally.settle();
+        assertApproxEqAbs(tally.gap(), 1_600e18, 1e12);
+    }
+
+    function test_gap_routes_and_sorts() public {
+        _borrow(1_000_000e18);
+        usds.mint(address(tally), 10_000e18);   // float
+        tally.poke(); tally.file("route", tally.MTM());
+        vm.warp(block.timestamp + 1 days);
+        usdc.mint(alm, 3_400e6);             // 2,100 BUIDL dividend (Sky's) + 1,300 sweep (prime's)
+        // Operator attributes the Sky part before the settle books the rest to the prime.
+        tally.poke();                        // realise today's flux
+        tally.sort(2_100e18, tally.SDE());   // gap goes negative by 2,100 until settle nets flux in
+        tally.settle();
+        assertEq(tally.gap(), 0);
+        // sv = gain(1,300) - tab(~100) ... paid to the SubProxy; sde 2,100 went to Sky's share.
+        assertGt(usds.balanceOf(sub), 1_100e18);
+        assertLt(usds.balanceOf(sub), 1_300e18);
+    }
+
+    function test_gap_excludes_tallys_own_draw() public {
+        _borrow(1_000_000_000e18);
+        _fund(30_000_000e18);
+        vm.warp(block.timestamp + 1 days);
+        sUsdc.setPps(2_100_000);
+        tally.settle();                      // draws ~107,000 of new debt that never enters the ALM
+        vm.warp(block.timestamp + 1 days);
+        tally.settle();
+        assertEq(tally.gap(), 0);
     }
 
     // --- settle ---

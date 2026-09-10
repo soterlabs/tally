@@ -119,6 +119,8 @@ abstract contract ForkBase is Test {
         console2.log("agent rate      %s      %s", owe / 1e16, pAgent / 1e16);
         console2.log("rebates         %s", rebate / 1e16);
         console2.log("net BR (tab-rb) %s", (tab - (rebate < tab ? rebate : tab)) / 1e16);
+        int256 gp; for (uint256 i = 0; i < ts.length; i++) gp += ts[i].gap() + ts[i].flux() - ts[i].capital();
+        console2.log("equity gap      %s%s   (value that entered without a draw, or left without a wipe)", gp < 0 ? "-" : "+", uint256(gp < 0 ? -gp : gp) / 1e16);
         console2.log("(cents)");
     }
 }
