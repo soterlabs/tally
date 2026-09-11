@@ -3,6 +3,7 @@ pragma solidity ^0.8.21;
 
 import { Test } from "forge-std/Test.sol";
 import { Tally } from "../src/Tally.sol";
+import { Till } from "../src/Till.sol";
 import { TallyJob } from "../src/TallyJob.sol";
 import { RawPip, RelayPip } from "../src/Pips.sol";
 import { MockToken, MockSusds, MockVat, MockJoin, MockAllocatorVault, MockBuffer } from "./Tally.t.sol";
@@ -30,11 +31,12 @@ contract TallyJobTest is Test {
         MockBuffer buffer = new MockBuffer();
         MockAllocatorVault vault = new MockAllocatorVault(address(vat), address(join), ilk, address(buffer));
         vat.set(ilk, 1_000_000e18, RAY);
-        t = new Tally(ilk, address(vat), vow, address(join), address(usds), address(susds));
-        vault.rely(address(t));
-        buffer.approve(address(usds), address(t), type(uint256).max);
-        t.file("alm", alm); t.file("sub", sub);
-        t.file("vault", address(vault)); t.file("buffer", address(buffer));
+        t = new Tally(ilk, address(vat), address(usds), address(susds));
+        Till till = new Till(vow, address(join), address(usds));
+        till.rely(address(t)); vault.rely(address(till));
+        buffer.approve(address(usds), address(till), type(uint256).max);
+        till.file("vault", address(vault)); till.file("buffer", address(buffer));
+        t.file("alm", alm); t.file("sub", sub); t.file("till", address(till));
         t.file("pad", 0.002e27); t.file("tip", 0.002e27); t.file("pay", 1);
         usds.mint(alm, 1_000e18);
         t.init(address(usds), address(new RawPip(address(usds))), t.MTM());

@@ -11,10 +11,11 @@ On-chain, daily counterpart of the Monthly Settlement Cycle (`../settlement-cycl
   ilk debt through the AllocatorVault within the debt ceiling, pays the prime
   share to the SubProxy, and joins Sky's net to the surplus buffer. No Vat
   privileges.
+- `src/Till.sol` — the cash register: holds the USDS float and the allocator roles; draws, pays the SubProxy and banks Sky's net on `Tally`'s instruction.
 - `src/TallyJob.sol` — dss-cron job: settles each instance once per UTC day, skipping any whose settle would revert.
 - `src/Pips.sol` — adapters: raw stablecoin, ERC-4626, ERC-7540, Aave/SparkLend aToken, Chronicle-priced,
   lending idle share, Curve leg, Uniswap V3 positions, declared-capital (BUIDL-style yield), relayed.
-- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol` — 46 tests against mocks.
+- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol` — 48 tests against mocks.
 - `test/Backtest.t.sol` — mainnet fork backtests: Obex, Osero and Grove, August 2026, versus `settlement-cycle` (see `DESIGN.md` §5).
 
 ```shell

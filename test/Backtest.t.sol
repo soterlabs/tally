@@ -41,7 +41,7 @@ abstract contract ForkBase is Test {
     function _afterFork() internal virtual {}
 
     function _new(bytes32 ilk, address alm, address sub, uint256 pay) internal returns (Tally t) {
-        t = new Tally(ilk, VAT, VOW, USDS_JOIN, USDS, SUSDS);
+        t = new Tally(ilk, VAT, USDS, SUSDS);
         t.file("alm", alm);
         t.file("sub", sub);
         t.file("pad", 0.002e27);

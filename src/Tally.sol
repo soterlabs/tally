@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-/// Tally.sol -- daily settlement cycle for one Sky allocator ilk
+/// Tally.sol -- daily settlement cycle for one Sky allocator ilk: the books
 
 // Copyright (C) 2026 Soter Labs
 //
@@ -25,21 +25,13 @@ interface VatLike {
     function debt() external view returns (uint256);
 }
 
-// dss-allocator: `draw` mints new ilk debt as USDS into the AllocatorBuffer;
-// the buffer itself only exposes `approve`, so we pull with `transferFrom`.
-interface VaultLike {
-    function draw(uint256 wad) external;
-}
-
-interface JoinLike {
-    function join(address usr, uint256 wad) external;
+interface TillLike {
+    function pay(uint256 drew, uint256 send, address to) external returns (uint256 paid, uint256 kept);
 }
 
 interface GemLike {
     function balanceOf(address) external view returns (uint256);
-    function approve(address, uint256) external returns (bool);
     function transfer(address, uint256) external returns (bool);
-    function transferFrom(address, address, uint256) external returns (bool);
 }
 
 interface SusdsLike {
@@ -102,13 +94,11 @@ interface PipLike {
  *             send = owe + max(sv, 0)             paid to the SubProxy
  *
  *           A negative `sv` is carried in `sin` against future supply
- *           gains only; the demand side is always paid. `mint` is drawn
- *           through `AllocatorVault.draw` within the ilk's debt ceiling
- *           (the rest is carried), pulled from the AllocatorBuffer, and
- *           pays `send` first; what is left is Sky's net and is joined to
- *           the surplus buffer. When `send` exceeds the draw, the
- *           difference is paid from USDS governance keeps here and
- *           otherwise carried in `owe`. No Vat privileges are needed.
+ *           gains only; the demand side is always paid. `mint` is capped
+ *           by the ilk's debt-ceiling headroom (the rest is carried) and
+ *           handed with `send` to the `Till`, which draws, pays the
+ *           SubProxy and banks Sky's net. Whatever the Till could not pay
+ *           is carried in `owe`. `Tally` holds no tokens and no roles.
  *
  *         Amounts are wad regardless of token decimals; rates are ray.
  *         `pad`, `tip`, `cut` are NOMINAL annual rates applied as
@@ -148,16 +138,13 @@ contract Tally {
     // System
     bytes32   public immutable ilk;
     VatLike   public immutable vat;
-    address   public immutable vow;    // surplus buffer
-    JoinLike  public immutable join;   // UsdsJoin
     GemLike   public immutable usds;
     SusdsLike public immutable susds;
 
     // Prime
     address public alm;      // ALM Proxy: default holder of the gems
     address public sub;      // SubProxy: paid at settle
-    address public vault;    // AllocatorVault: draws the mint as ilk debt
-    address public buffer;   // AllocatorBuffer: where the vault delivers USDS
+    address public till;     // Till: draws, pays and banks on our instruction
     uint256 public pay;      // 1 if this ilk carries the prime's demand side (agent rate, gifts)
 
     // Rates
@@ -209,18 +196,16 @@ contract Tally {
     event Drip(uint256 debt, uint256 dchi, uint256 fee, uint256 agentRate, uint256 rebates);
     event Poke(address indexed gem, uint256 pie, uint256 chi, uint256 own, uint256 val, int256 dpnl);
     event Gift(uint256 wad);
-    event Settle(int256 sky, int256 sv, uint256 dv, uint256 mint, uint256 drew, uint256 send, uint256 paid, uint256 kept);
+    event Settle(int256 sky, int256 sv, uint256 dv, uint256 mint, uint256 drew, uint256 send, uint256 paid);
     event Gap(int256 flux, int256 capital, int256 gap, uint8 route);
     event Sort(int256 wad, uint8 to);
     event Quit(address indexed gem, address indexed dst, uint256 wad);
     event Cage();
 
     // --- Init ---
-    constructor(bytes32 ilk_, address vat_, address vow_, address join_, address usds_, address susds_) {
+    constructor(bytes32 ilk_, address vat_, address usds_, address susds_) {
         ilk   = ilk_;
         vat   = VatLike(vat_);
-        vow   = vow_;
-        join  = JoinLike(join_);
         usds  = GemLike(usds_);
         susds = SusdsLike(susds_);
         live  = 1;
@@ -230,8 +215,6 @@ contract Tally {
         art   = debt();
         wards[msg.sender] = 1;
         emit Rely(msg.sender);
-        // The join burns from us when we credit the surplus buffer.
-        usds.approve(join_, type(uint256).max);
     }
 
     // --- Math ---
@@ -296,9 +279,8 @@ contract Tally {
 
     function file(bytes32 what, address data) external auth {
         require(live == 1, "Tally/not-live");
-        if      (what == "alm")    alm    = data;
-        else if (what == "vault")  vault  = data;
-        else if (what == "buffer") buffer = data;
+        if      (what == "alm")  alm  = data;
+        else if (what == "till") till = data;
         else if (what == "sub") {
             // Drip first so the old SubProxy's interval is credited to it.
             require(block.timestamp == rho, "Tally/rho-not-updated");
@@ -361,8 +343,8 @@ contract Tally {
         emit Sort(wad, to);
     }
 
-    /// @notice Move tokens out (the USDS float, a mistaken transfer). Works
-    ///         after `cage`, so nothing is ever stranded here.
+    /// @notice Move a mistaken transfer out. Tally holds nothing by design;
+    ///         the float lives in the Till. Works after `cage`.
     function quit(address gem, address dst, uint256 wad) external auth {
         require(GemLike(gem).transfer(dst, wad), "Tally/transfer-failed");
         emit Quit(gem, dst, wad);
@@ -537,7 +519,6 @@ contract Tally {
         uint256 drew;  // actually drawn within the ceiling
         uint256 send;  // whole USDS owed to the SubProxy today
         uint256 paid;  // actually paid
-        uint256 kept;  // Sky's net, joined to the surplus buffer
     }
 
     /// @notice Run the day: accrue, mark, and execute the MSC identity in whole USDS.
@@ -575,39 +556,26 @@ contract Tally {
         if (mint_ < 0) { carry = mint_; }
         else { d.mint = _whole(uint256(mint_)); carry = mint_ - int256(d.mint); }
 
-        d.drew = _draw(d.mint);
+        // Draw within today's ceiling headroom; the rest waits on the Sky side.
+        d.drew = _whole(_min(d.mint, room()));
         carry += int256(d.mint - d.drew);
+        capital -= int256(d.drew);   // this debt does not fund the ALM
 
         tab = 0; gain = 0; rebate = 0;
         sde = carry;
         sin = d.sv < 0 ? uint256(-d.sv) : 0;
         owe = (d.dv + d.up) - d.send;
 
-        // Send: pay the SubProxy from the fresh draw, then from any USDS
-        // governance keeps here; whatever cannot be paid is owed.
-        d.paid = _min(d.send, usds.balanceOf(address(this)));
-        if (d.paid > 0) require(usds.transfer(sub, d.paid), "Tally/transfer-failed");
+        // The Till draws, pays the SubProxy and banks Sky's net. What it
+        // could not pay is owed.
+        if (d.drew > 0 || d.send > 0) {
+            require(till != address(0), "Tally/till-not-set");
+            (d.paid,) = TillLike(till).pay(d.drew, d.send, sub);
+        }
         owe += d.send - d.paid;
 
-        // Keep: Sky's net goes to the surplus buffer.
-        d.kept = d.drew > d.send ? d.drew - d.send : 0;
-        if (d.kept > 0) join.join(vow, d.kept);
-
         zzz = block.timestamp;
-        emit Settle(d.sky, d.sv, d.dv, d.mint, d.drew, d.send, d.paid, d.kept);
-    }
-
-    // Draw `mint` as new ilk debt through the prime's allocator stack, within
-    // today's ceiling headroom, and pull it here. Returns what was drawn.
-    function _draw(uint256 mint) internal returns (uint256 drew) {
-        if (mint == 0) return 0;
-        require(vault != address(0) && buffer != address(0), "Tally/vault-not-set");
-        drew = _whole(_min(mint, room()));
-        if (drew > 0) {
-            VaultLike(vault).draw(drew);
-            require(usds.transferFrom(buffer, address(this), drew), "Tally/transfer-failed");
-            capital -= int256(drew);   // this debt did not fund the ALM
-        }
+        emit Settle(d.sky, d.sv, d.dv, d.mint, d.drew, d.send, d.paid);
     }
 
     // --- Views ---

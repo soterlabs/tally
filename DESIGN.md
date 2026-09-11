@@ -100,7 +100,8 @@ gems and `debt = 0` still pays their agent rate through `drip` + `settle`.
 | `pip` | pricing adapter for a gem, `peek(who) → (pie, chi, own)` | Spot / OSM |
 | `who` | holder override for a gem (0 = `alm`) | — |
 | `tag` | routing: `MTM`, `SDE`, `SAV`, `IDL`, `NIL` | — |
-| `vault` / `buffer` | the prime's AllocatorVault / AllocatorBuffer | dss-allocator |
+| `till` | the Till that draws, pays and banks for this Tally | — |
+| `vault` / `buffer` (Till) | the prime's AllocatorVault / AllocatorBuffer | dss-allocator |
 | `pie` / `chi` | per gem: shares held / price per 1e18 shares (ray) | Pot / sUSDS |
 | `chi` (ilk) | sUSDS share price at last drip, the SSR index (wad) | Pot / sUSDS |
 | `art` / `usd` / `sus` | ilk debt, SubProxy USDS, SubProxy sUSDS value at last drip | Vat `art` |
@@ -248,9 +249,10 @@ perimeter is still open (Spark, Grove until the L2 relays land) and `MTM` for
 one whose perimeter is closed (Obex, Osero), where a non-zero `gap` is a
 leak or an unpriced venue and a zero `gap` is a daily correctness check.
 
-### 2.5 Settlement
+### 2.5 Settlement: `Tally` decides, `Till` moves
 
-`settle()` is permissionless. It drips, pokes every gem, then:
+`settle()` on `Tally` is permissionless. It drips, pokes every gem, routes
+the gap, then:
 
 ```
 rebate = min(rebate, tab)          never hand back more than was charged
@@ -261,42 +263,47 @@ mint   = floor(sky + up)           fraction, a negative total, and anything the
                                    ceiling blocks carry in `sde`
 send   = floor(owe + up)           fraction carries in `owe`
 sin    = max(−sv, 0)               a supply loss waits for supply gains only
+drew   = min(mint, room)           room = ilk and global ceiling headroom, less 1 USDS
 
-drew = min(mint, room)             room = ilk and global ceiling headroom, less 1 USDS
-vault.draw(drew); usds.transferFrom(buffer, this, drew)
-usds.transfer(sub, min(send, balance))     shortfall beyond the draw comes from
-                                           USDS governance parks here; unpaid → owe
-join(vow, drew − send)             Sky's net, credited to the surplus buffer
+till.pay(drew, send, sub)          Till: vault.draw(drew); pull from the buffer;
+                                   pay min(send, balance) to the SubProxy;
+                                   join(vow, drew − send)
+owe   += send − paid               what the Till could not pay is owed
 ```
+
+`Tally` holds the books and no tokens. `Till` holds the USDS float and the
+prime-scoped allocator roles, and only `Tally` may call `pay`. The split is
+the Vat / Vow shape: accounting in one immutable contract, cash in another,
+each auditable alone, no delegatecall and no shared storage. A prime with
+several ilks has one `Till` per `Tally`; the float is per prime and can be
+topped up on whichever `Till` pays the demand side.
 
 This nets the two MSC legs: the prime's fresh debt pays the SubProxy directly
 and only Sky's net crosses into the Vow. When `send` exceeds the draw (Keel,
 Skybase, any prime whose demand side exceeds its Sky share) Sky's part comes
 from the pre-funded float, the on-chain form of the Demand-Side Buffer
 transfer in today's settlement transaction. If the float runs dry the balance
-is owed, not lost. `quit` lets governance move the float, or anything else,
-out at any time, including after `cage`.
+is owed, not lost. `Till.quit` lets governance move the float, or anything
+else, out at any time.
 
 **Departure from the monthly identity.** The MSC nets a negative supply share
 inside the send (`send = dv + sv`). Done daily that is path-dependent: a loss
 day eats the agent rate, and the recovery day mints the prime new debt to pay
 itself back. `Tally` instead carries the loss in `sin` and pays the demand
-side regardless. Over any window the totals match a single monthly netting
-only when the supply share ends positive; when it ends negative the prime
-keeps its demand side and Sky keeps the loss on the books until supply gains
-absorb it.
+side regardless.
 
-**Debt ceiling.** `room(ilk)` reads the ilk `line` and the global `Line`. The
+**Debt ceiling.** `room()` reads the ilk `line` and the global `Line`. The
 draw is capped at whatever headroom exists and the remainder carries on the
 Sky side, so a prime at its AutoLine cap still gets its demand side paid and
 Sky's charge keeps accruing instead of the whole cycle reverting.
 
 ### 2.6 Permissions
 
-`Tally` needs the prime-scoped roles the ALM controller already holds:
+`Till` needs the prime-scoped roles the ALM controller already holds:
 `AllocatorVault.draw` for its ilk and a USDS allowance from the
-AllocatorBuffer (`buffer.approve(usds, tally, max)`; the audited buffer has
-no `withdraw`, only `approve`). It
+AllocatorBuffer (`buffer.approve(usds, till, max)`; the audited buffer has
+no `withdraw`, only `approve`). `Tally` needs `Till.wards` to call `pay`,
+and nothing else. It
 holds no Vat authority. Governance holds `Tally.wards` for `init`, `file`,
 `gift`, `cage`, and tops up the USDS float for demand-side payments. The
 hybrid process needs `gift` and `RelayPip.poke` only. `drip`, `poke`,
@@ -374,7 +381,7 @@ made per chain and upgraded later without touching `Tally`.
 
 - `src/Tally.sol`: the contract above.
 - `src/Pips.sol`: the five adapters.
-- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 46 tests against mocks of Vat, AllocatorVault,
+- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 48 tests against mocks of Vat, AllocatorVault,
   AllocatorBuffer, UsdsJoin, sUSDS, ERC-4626/7540 vaults and an aToken pool,
   covering rates, index PnL, haircuts, escrow, SDE caps, SAV and IDL rebates,
   subsidy, whole-USDS settlement with carries, the negative prime share, the
@@ -514,6 +521,14 @@ the drip interval. Obex backtest unchanged on the daily cadence.
 2026-09-08: `TallyJob` (dss-cron `IJob`) settles each instance once per UTC
 day; `zzz` records the last settle so relayer drips do not suppress it.
 Backtests for Osero and Grove added alongside Obex (§5).
+
+2026-09-11: `Tally` / `Till` split. `Tally` keeps the books and holds nothing;
+`Till` holds the float and the allocator roles and executes `pay(drew, send,
+to)` on `Tally`'s instruction. Same public `settle()`, same tests, same
+backtest figures. Runtime size 22,233 → 20,900 bytes for `Tally`; the bulk
+of the remainder is the `file` overloads and revert strings, not settlement.
+A diamond was considered and rejected: pips are configured instances, not
+code, and Sky's contracts avoid delegatecall proxies by design.
 
 2026-09-10: equity layer added: `flux`, `capital`, `gap`, `route`, `sort`.
 Recognition of unlabelled arrivals (dividends, sweeps) without sender labels;

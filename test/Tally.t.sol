@@ -3,6 +3,7 @@ pragma solidity ^0.8.21;
 
 import { Test } from "forge-std/Test.sol";
 import { Tally } from "../src/Tally.sol";
+import { Till } from "../src/Till.sol";
 import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, RelayPip } from "../src/Pips.sol";
 
 // --- Mocks ---
@@ -175,6 +176,7 @@ contract TallyTest is Test {
     MockBuffer buffer;
     MockAllocatorVault vault;
     Tally     tally;
+    Till      till;
 
     MockVault      sUsdc;   // 6-dec shares over USDC
     MockAsyncVault jtrsy;   // ERC-7540, 6-dec share over USDC
@@ -193,9 +195,13 @@ contract TallyTest is Test {
         buffer = new MockBuffer();
         vault  = new MockAllocatorVault(address(vat), address(join), ILK, address(buffer));
         vat.set(ILK, 0, RAY);
-        tally  = new Tally(ILK, address(vat), vow, address(join), address(usds), address(susds));
-        vault.rely(address(tally));
-        buffer.approve(address(usds), address(tally), type(uint256).max);
+        tally  = new Tally(ILK, address(vat), address(usds), address(susds));
+        till   = new Till(vow, address(join), address(usds));
+        till.rely(address(tally));
+        vault.rely(address(till));
+        buffer.approve(address(usds), address(till), type(uint256).max);
+        till.file("vault",  address(vault));
+        till.file("buffer", address(buffer));
 
         sUsdc      = new MockVault(address(usdc), 6, 1_050_000);
         jtrsy      = new MockAsyncVault(address(usdc), 6, 1_000_000);
@@ -213,8 +219,7 @@ contract TallyTest is Test {
 
         tally.file("alm",    alm);
         tally.file("sub",    sub);
-        tally.file("vault",  address(vault));
-        tally.file("buffer", address(buffer));
+        tally.file("till",   address(till));
         tally.file("pad", 0.002e27);   // BR = SSR + 20 bps
         tally.file("tip", 0.002e27);   // agent rate = SSR + 20 bps
         tally.file("pay", 1);
@@ -332,11 +337,11 @@ contract TallyTest is Test {
         RelayPip relay = new RelayPip();
         relay.poke(alm, 90_000_000e18, RAY, 0);
         tally.init(address(0xBA5E), address(relay), tally.IDL());
-        usds.mint(address(tally), 5_000e18);      // float
+        usds.mint(address(till), 5_000e18);      // float
         vm.warp(block.timestamp + 1 days);
         relay.poke(alm, 90_000_000e18, RAY, 0);
         tally.settle();
-        assertEq(usds.balanceOf(address(tally)), 5_000e18);
+        assertEq(usds.balanceOf(address(till)), 5_000e18);
         assertEq(usds.balanceOf(sub), 0);
     }
 
@@ -467,7 +472,7 @@ contract TallyTest is Test {
     function test_pay_flag_gates_demand_side() public {
         // A second instance on another ilk of the same prime shares the
         // SubProxy but does not carry the demand side.
-        Tally t2 = new Tally("ALLOCATOR-SPARK-B", address(vat), vow, address(join), address(usds), address(susds));
+        Tally t2 = new Tally("ALLOCATOR-SPARK-B", address(vat), address(usds), address(susds));
         t2.file("sub", sub);
         t2.file("tip", 0.002e27);
         usds.mint(sub, 30_000_000e18);
@@ -538,7 +543,7 @@ contract TallyTest is Test {
 
     function test_gap_routes_and_sorts() public {
         _borrow(1_000_000e18);
-        usds.mint(address(tally), 10_000e18);   // float
+        usds.mint(address(till), 10_000e18);   // float
         tally.poke(); tally.file("route", tally.MTM());
         vm.warp(block.timestamp + 1 days);
         usdc.mint(alm, 3_400e6);             // 2,100 BUIDL dividend (Sky's) + 1,300 sweep (prime's)
@@ -581,7 +586,7 @@ contract TallyTest is Test {
         assertApproxEqAbs(vat.ilkDebt(ILK) - debtBefore, 107_000e18, 1e9);
         assertEq(usds.balanceOf(sub) - 30_000_000e18, 7_766e18);
         assertEq(join.credited(vow), (107_000e18 - 7_766e18) * RAY);
-        assertEq(usds.balanceOf(address(tally)), 0);
+        assertEq(usds.balanceOf(address(till)), 0);
         assertEq(tally.tab(), 0); assertEq(tally.gain(), 0); assertEq(tally.rebate(), 0); assertEq(tally.sin(), 0);
         assertApproxEqAbs(tally.owe(), 0.48e18, 0.01e18);
         assertGe(tally.sde(), 0); assertLt(tally.sde(), 1e18);
@@ -612,7 +617,7 @@ contract TallyTest is Test {
         _debt(1_000_000_000e18);
         _fund(30_000_000e18);
         vat.setLine(ILK, 1_000_000_000e18 * RAY);   // no headroom at all
-        usds.mint(address(tally), 5_000e18);
+        usds.mint(address(till), 5_000e18);
         vm.warp(block.timestamp + 1 days);
         tally.settle();
         assertEq(usds.balanceOf(sub) - 30_000_000e18, 3_007e18);   // dv 3,007.91 -> 3,007 (sv < 0, carried)
@@ -637,7 +642,7 @@ contract TallyTest is Test {
     }
 
     function test_settle_never_nets_demand_side_against_supply_loss() public {
-        usds.mint(address(tally), 1_000e18);
+        usds.mint(address(till), 1_000e18);
         tally.poke();
         tally.file(address(susds), "tag", tally.NIL());   // silence the sUSDS rebate
         vm.warp(block.timestamp + 1 days);
@@ -659,12 +664,12 @@ contract TallyTest is Test {
 
     function test_settle_sky_pays_from_float_when_send_exceeds_mint() public {
         _fund(10_000_000e18);
-        usds.mint(address(tally), 5_000e18);
+        usds.mint(address(till), 5_000e18);
         vm.warp(block.timestamp + 1 days);
         tally.settle();
         // dv = 10e6 * 1.0026384e-4 = 1,002.64 ; rebate bounded by tab = 0 ; send -> 1,002
         assertEq(usds.balanceOf(sub) - 10_000_000e18, 1_002e18);
-        assertEq(usds.balanceOf(address(tally)), 3_998e18);
+        assertEq(usds.balanceOf(address(till)), 3_998e18);
         assertEq(join.credited(vow), 0);
     }
 
@@ -674,7 +679,7 @@ contract TallyTest is Test {
         tally.settle();
         assertEq(usds.balanceOf(sub), 10_000_000e18);
         assertApproxEqRel(tally.owe(), 1_002.64e18, 1e13);
-        usds.mint(address(tally), 5_000e18);
+        usds.mint(address(till), 5_000e18);
         vm.warp(block.timestamp + 1 days);
         tally.settle();
         assertEq(usds.balanceOf(sub) - 10_000_000e18, 2_005e18);
@@ -683,7 +688,7 @@ contract TallyTest is Test {
     function test_gift_pays_out_at_settle() public {
         _debt(1e18);
         tally.gift(1_000e18);
-        usds.mint(address(tally), 1_000e18);
+        usds.mint(address(till), 1_000e18);
         tally.settle();
         assertEq(usds.balanceOf(sub), 1_000e18);
     }
@@ -697,7 +702,7 @@ contract TallyTest is Test {
     function test_settle_needs_only_allocator_roles() public {
         MockBuffer b2 = new MockBuffer();
         MockAllocatorVault v2 = new MockAllocatorVault(address(vat), address(join), ILK, address(b2));
-        tally.file("vault", address(v2));
+        till.file("vault", address(v2));
         _debt(1_000_000_000e18);
         vm.warp(block.timestamp + 1 days);
         vm.expectRevert("AllocatorVault/not-authorized");
@@ -705,20 +710,38 @@ contract TallyTest is Test {
     }
 
     function test_settle_requires_vault_when_minting() public {
-        tally.file("vault", address(0));
+        till.file("vault", address(0));
         _debt(1_000_000_000e18);
         vm.warp(block.timestamp + 1 days);
-        vm.expectRevert("Tally/vault-not-set");
+        vm.expectRevert("Till/vault-not-set");
         tally.settle();
     }
 
+    function test_settle_requires_till_when_paying() public {
+        tally.file("till", address(0));
+        _debt(1_000_000_000e18);
+        vm.warp(block.timestamp + 1 days);
+        vm.expectRevert("Tally/till-not-set");
+        tally.settle();
+        // Nothing to move: settles fine without a Till.
+        Tally t2 = new Tally("ALLOCATOR-SPARK-B", address(vat), address(usds), address(susds));
+        vm.warp(block.timestamp + 1 days);
+        t2.settle();
+    }
+
+    function test_only_tally_can_make_the_till_pay() public {
+        vm.prank(address(0xDEAD));
+        vm.expectRevert("Till/not-authorized");
+        till.pay(0, 1e18, sub);
+    }
+
     function test_quit_recovers_float_after_cage() public {
-        usds.mint(address(tally), 5_000e18);
+        usds.mint(address(till), 5_000e18);
         tally.cage();
         vm.expectRevert("Tally/not-live");
         tally.settle();
-        tally.quit(address(usds), address(0xF10A7), 5_000e18);
+        till.quit(address(usds), address(0xF10A7), 5_000e18);
         assertEq(usds.balanceOf(address(0xF10A7)), 5_000e18);
-        assertEq(usds.balanceOf(address(tally)), 0);
+        assertEq(usds.balanceOf(address(till)), 0);
     }
 }
