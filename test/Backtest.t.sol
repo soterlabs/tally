@@ -3,6 +3,7 @@ pragma solidity ^0.8.21;
 
 import { Test, console2 } from "forge-std/Test.sol";
 import { Tally } from "../src/Tally.sol";
+import { Till } from "../src/Till.sol";
 import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip, CurveLegPip, UniV3Pip } from "../src/Pips.sol";
 
 interface KissLike { function kiss(address) external; }
@@ -40,14 +41,21 @@ abstract contract ForkBase is Test {
     // Per-fork fixtures that live in non-persistent contracts (e.g. an oracle whitelist).
     function _afterFork() internal virtual {}
 
+    // The backtests only drip and poke, but wire a Till anyway so a run that
+    // calls settle() behaves as a deployment would (it needs the allocator
+    // roles, which a historical fork cannot grant).
     function _new(bytes32 ilk, address alm, address sub, uint256 pay) internal returns (Tally t) {
         t = new Tally(ilk, VAT, USDS, SUSDS);
+        Till till = new Till(address(t), VOW, USDS_JOIN, USDS);
+        till.rely(address(t));
         t.file("alm", alm);
         t.file("sub", sub);
+        t.file("till", address(till));
         t.file("pad", 0.002e27);
         t.file("tip", 0.002e27);
         t.file("pay", pay);
         vm.makePersistent(address(t));
+        vm.makePersistent(address(till));
     }
 
     function _raw(Tally t, address gem, uint8 tag) internal { _raw(t, gem, gem, tag, address(0)); }

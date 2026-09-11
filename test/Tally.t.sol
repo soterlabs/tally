@@ -131,7 +131,7 @@ contract MockJoin {
 
 // AllocatorVault: draw frobs the ilk and exits USDS to the buffer.
 contract MockAllocatorVault {
-    MockVat vat; MockJoin join; bytes32 ilk; address public buffer;
+    MockVat vat; MockJoin join; bytes32 public ilk; address public buffer;
     mapping (address => uint256) public wards;
     constructor(address vat_, address join_, bytes32 ilk_, address buffer_) { vat = MockVat(vat_); join = MockJoin(join_); ilk = ilk_; buffer = buffer_; wards[msg.sender] = 1; }
     function rely(address u) external { wards[u] = 1; }
@@ -196,7 +196,7 @@ contract TallyTest is Test {
         vault  = new MockAllocatorVault(address(vat), address(join), ILK, address(buffer));
         vat.set(ILK, 0, RAY);
         tally  = new Tally(ILK, address(vat), address(usds), address(susds));
-        till   = new Till(vow, address(join), address(usds));
+        till   = new Till(address(tally), vow, address(join), address(usds));
         till.rely(address(tally));
         vault.rely(address(till));
         buffer.approve(address(usds), address(till), type(uint256).max);
@@ -717,22 +717,107 @@ contract TallyTest is Test {
         tally.settle();
     }
 
-    function test_settle_requires_till_when_paying() public {
+    function test_settle_carries_when_the_till_is_unset() public {
+        // No Till: the day still closes, the Sky share is carried, nothing stalls.
         tally.file("till", address(0));
-        _debt(1_000_000_000e18);
+        _borrow(1_000_000_000e18);
+        _fund(30_000_000e18);
         vm.warp(block.timestamp + 1 days);
-        vm.expectRevert("Tally/till-not-set");
         tally.settle();
-        // Nothing to move: settles fine without a Till.
-        Tally t2 = new Tally("ALLOCATOR-SPARK-B", address(vat), address(usds), address(susds));
+        assertEq(tally.zzz(), block.timestamp);           // zzz advanced: TallyJob is satisfied
+        assertEq(usds.balanceOf(sub), 30_000_000e18);     // nothing paid
+        assertApproxEqRel(tally.sde(), 100_241e18, 1e13); // Sky share waits
+        assertApproxEqRel(tally.owe(), 3_007.91e18, 1e13); // demand side owed
+        assertEq(vat.ilkDebt(ILK), 1_000_000_000e18);     // nothing drawn
+
+        // Till wired later: the carry is drawn and the arrears paid.
+        tally.file("till", address(till));
         vm.warp(block.timestamp + 1 days);
-        t2.settle();
+        tally.settle();
+        assertGt(usds.balanceOf(sub), 30_006_000e18);
+        assertLt(tally.sde(), 1e18);
+        // The carry never leaked into the equity gap.
+        assertEq(tally.gap(), 0);
     }
 
     function test_only_tally_can_make_the_till_pay() public {
+        // Not even a ward: the paired Tally is the sole caller.
+        assertEq(till.wards(address(this)), 1);
+        vm.expectRevert("Till/not-tally");
+        till.pay(1_000e18, 1_000e18, address(0xDEAD));
         vm.prank(address(0xDEAD));
-        vm.expectRevert("Till/not-authorized");
+        vm.expectRevert("Till/not-tally");
         till.pay(0, 1e18, sub);
+        assertEq(till.tally(), address(tally));
+        assertEq(till.ilk(), ILK);
+    }
+
+    function test_till_rejects_a_vault_on_another_ilk() public {
+        MockBuffer b2 = new MockBuffer();
+        MockAllocatorVault other = new MockAllocatorVault(address(vat), address(join), "ALLOCATOR-SPARK-B", address(b2));
+        vm.expectRevert("Till/wrong-ilk");
+        till.file("vault", address(other));
+        till.file("vault", address(0));   // unsetting is allowed
+        assertEq(till.vault(), address(0));
+    }
+
+    function test_till_cage_disarms_the_money_path() public {
+        _debt(1_000_000_000e18);
+        _fund(30_000_000e18);
+        till.cage();
+        vm.warp(block.timestamp + 1 days);
+        vm.expectRevert("Till/not-live");
+        tally.settle();
+        // Governance can still unwind: file and quit stay open.
+        usds.mint(address(till), 1_000e18);
+        till.quit(address(usds), address(0xF10A7), 1_000e18);
+        assertEq(usds.balanceOf(address(0xF10A7)), 1_000e18);
+    }
+
+    function test_till_pay_rejects_a_zero_payee() public {
+        vm.expectRevert("Tally/no-payee");
+        tally.file("sub", address(0));
+    }
+
+    function test_till_approve_is_reissuable() public {
+        assertEq(usds.allowance(address(till), address(join)), type(uint256).max);
+        vm.prank(address(till));
+        usds.approve(address(join), 0);
+        till.approve();
+        assertEq(usds.allowance(address(till), address(join)), type(uint256).max);
+    }
+
+    function test_init_of_a_rebated_gem_requires_a_fresh_drip() public {
+        RelayPip relay = new RelayPip();
+        relay.poke(alm, 90_000_000e18, RAY, 0);
+        _debt(1_000_000_000e18);            // so an IDL gem would earn a rebate
+        uint8 idl = tally.IDL();            // hoisted: expectRevert arms the NEXT call
+        vm.warp(block.timestamp + 1 days);
+        vm.expectRevert("Tally/rho-not-updated");
+        tally.init(address(0xBA5E), address(relay), idl);
+        tally.init(address(0xBA5F), address(relay), tally.MTM());   // MTM books no rebate: fine
+        tally.drip();
+        tally.init(address(0xBA5E), address(relay), idl);
+        // The freshly inited gem earns nothing for the interval before it existed.
+        uint256 rb = tally.rebate();
+        tally.drip();
+        assertEq(tally.rebate(), rb);
+    }
+
+    function test_file_alm_requires_pokes_and_reseeds() public {
+        vm.warp(block.timestamp + 1 days);
+        vm.expectRevert("Tally/gem-rho-not-updated");
+        tally.file("alm", address(0xA2));
+
+        // A new, empty ALM: the whole NAV difference must not book as revenue.
+        tally.drip(); tally.poke();
+        int256 gainBefore = tally.gain();
+        int256 fluxBefore = tally.flux();
+        tally.file("alm", address(0xA2));
+        assertEq(tally.nav(), 0);
+        tally.poke();
+        assertEq(tally.gain(), gainBefore);
+        assertEq(tally.flux(), fluxBefore);
     }
 
     function test_quit_recovers_float_after_cage() public {

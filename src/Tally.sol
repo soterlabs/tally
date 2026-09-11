@@ -196,7 +196,7 @@ contract Tally {
     event Drip(uint256 debt, uint256 dchi, uint256 fee, uint256 agentRate, uint256 rebates);
     event Poke(address indexed gem, uint256 pie, uint256 chi, uint256 own, uint256 val, int256 dpnl);
     event Gift(uint256 wad);
-    event Settle(int256 sky, int256 sv, uint256 dv, uint256 mint, uint256 drew, uint256 send, uint256 paid);
+    event Settle(int256 sky, int256 sv, uint256 dv, uint256 mint, uint256 drew, uint256 send, uint256 paid, uint256 kept);
     event Gap(int256 flux, int256 capital, int256 gap, uint8 route);
     event Sort(int256 wad, uint8 to);
     event Quit(address indexed gem, address indexed dst, uint256 wad);
@@ -249,6 +249,10 @@ contract Tally {
         require(live == 1, "Tally/not-live");
         require(gems[gem].tag == 0, "Tally/gem-already-init");
         require(tag >= MTM && tag <= NIL, "Tally/bad-tag");
+        // A gem that earns a rebate must not be added mid-interval: `drip`
+        // prices rebates over the whole elapsed interval, so a position in the
+        // book for one second would be credited for a full day.
+        if (tag == SAV || tag == IDL || tag == SDE) require(block.timestamp == rho, "Tally/rho-not-updated");
         Gem storage g = gems[gem];
         g.pip = pip;
         g.tag = tag;
@@ -279,9 +283,22 @@ contract Tally {
 
     function file(bytes32 what, address data) external auth {
         require(live == 1, "Tally/not-live");
-        if      (what == "alm")  alm  = data;
+        if (what == "alm") {
+            // The default holder of every gem: poke first so the open interval
+            // is booked against the old holder, then re-seed every mark so the
+            // move itself is not booked as PnL or paid out as an arrival.
+            for (uint256 k = 0; k < list.length; k++) {
+                require(block.timestamp == gems[list[k]].rho, "Tally/gem-rho-not-updated");
+            }
+            alm = data;
+            for (uint256 k = 0; k < list.length; k++) {
+                Gem storage g = gems[list[k]];
+                (g.pie, g.chi, g.own) = _read(list[k]);
+            }
+        }
         else if (what == "till") till = data;
         else if (what == "sub") {
+            require(data != address(0), "Tally/no-payee");
             // Drip first so the old SubProxy's interval is credited to it.
             require(block.timestamp == rho, "Tally/rho-not-updated");
             sub = data;
@@ -519,6 +536,7 @@ contract Tally {
         uint256 drew;  // actually drawn within the ceiling
         uint256 send;  // whole USDS owed to the SubProxy today
         uint256 paid;  // actually paid
+        uint256 kept;  // Sky's net, banked by the Till
     }
 
     /// @notice Run the day: accrue, mark, and execute the MSC identity in whole USDS.
@@ -557,7 +575,7 @@ contract Tally {
         else { d.mint = _whole(uint256(mint_)); carry = mint_ - int256(d.mint); }
 
         // Draw within today's ceiling headroom; the rest waits on the Sky side.
-        d.drew = _whole(_min(d.mint, room()));
+        if (d.mint > 0) d.drew = _whole(_min(d.mint, room()));
         carry += int256(d.mint - d.drew);
         capital -= int256(d.drew);   // this debt does not fund the ALM
 
@@ -566,16 +584,22 @@ contract Tally {
         sin = d.sv < 0 ? uint256(-d.sv) : 0;
         owe = (d.dv + d.up) - d.send;
 
-        // The Till draws, pays the SubProxy and banks Sky's net. What it
-        // could not pay is owed.
-        if (d.drew > 0 || d.send > 0) {
-            require(till != address(0), "Tally/till-not-set");
-            (d.paid,) = TillLike(till).pay(d.drew, d.send, sub);
-        }
-        owe += d.send - d.paid;
-
         zzz = block.timestamp;
-        emit Settle(d.sky, d.sv, d.dv, d.mint, d.drew, d.send, d.paid);
+
+        // The Till draws, pays the SubProxy and banks Sky's net. If there is
+        // no Till, or it cannot pay in full, the day still closes and the
+        // balance is owed: the cycle carries rather than stalling. A draw the
+        // Till did not make is carried on the Sky side too.
+        if ((d.drew > 0 || d.send > 0) && till != address(0)) {
+            (d.paid, d.kept) = TillLike(till).pay(d.drew, d.send, sub);
+        } else if (d.drew > 0) {
+            sde += int256(d.drew);        // undo the carry deduction above
+            capital += int256(d.drew);    // ... and its capital exclusion
+            d.drew = 0;
+        }
+        owe += d.send > d.paid ? d.send - d.paid : 0;
+
+        emit Settle(d.sky, d.sv, d.dv, d.mint, d.drew, d.send, d.paid, d.kept);
     }
 
     // --- Views ---

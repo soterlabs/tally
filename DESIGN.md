@@ -70,19 +70,31 @@ Facts from the off-chain pipeline that shaped the design:
                  │         SubProxy USDS/sUSDS × (Δchi+tip) → owe │──► sUSDS.convertToAssets, balances
                  │  poke   Σ pip.peek(who) → gain / sde / rebate │──► Pips ──► vaults, aTokens
                  │  settle sky, sv, mint, send (whole USDS)      │
-                 │         vault.draw(min(mint, room)); transferFrom │──► AllocatorVault, AllocatorBuffer
-                 │         usds.transfer(sub, send)              │
-                 │         join(vow, mint − send)                │──► UsdsJoin
-  governance     │  init / file / gift / rely / deny / cage      │
-  ─────────────► └──────────────────────────────────────────────┘
-                                   │ events: Drip, Poke, Settle
+                 │         gap = flux − capital, routed          │
+  governance     │  init / file / gift / sort / rely / deny / cage│
+  ─────────────► └───────────────┬──────────────────────────────┘
+                                 │ till.pay(drew, send, sub)
+                 ┌───────────────▼──────────────────────────────┐
+                 │ Till  (one per Tally; holds the USDS float)   │
+                 │  draw within the ceiling                      │──► AllocatorVault
+                 │  pull the draw                                │──► AllocatorBuffer (allowance)
+                 │  pay the SubProxy                             │
+                 │  join Sky's net                               │──► UsdsJoin
+                 └──────────────────────────────────────────────┘
+                                   │ events: Drip, Poke, Gap, Settle, Pay
                                    ▼
                  settlement-cycle (hybrid: idle deductions, DR, off-chain venues)
 ```
 
 **Deployment [D]:** Ethereum only for now (the ilks live there). One `Tally`
-instance per allocator ilk, with `ilk` immutable and `alm`, `sub`, `vault`,
-`buffer` filed by governance: Spark, Bloom, Grove (Diamond PAU), Obex, Prysm.
+plus one `Till` per allocator ilk: Spark, Bloom, Grove (Diamond PAU), Obex,
+Prysm. `Tally.ilk` and `Till.tally` are immutable; `alm`, `sub` and `till`
+are filed on the Tally, `vault` and `buffer` on the Till. The spell order is:
+deploy `Tally`, deploy `Till(tally, vow, join, usds)`, `till.rely(tally)`,
+`till.file("vault"|"buffer")`, grant the Till `AllocatorVault.draw` and the
+buffer's USDS allowance, `tally.file("till", till)`, then the gems and rates.
+`Till` checks the filed vault's `ilk()` against its Tally's, so a
+cross-wired pair cannot be filed.
 A prime with two ilks (Grove) deploys two instances sharing `sub` and sets
 `pay = 1` on exactly one, so the agent rate on the shared SubProxy is paid
 once. Keel and Skybase have no ilk and no ALM positions; an instance with no
@@ -102,6 +114,7 @@ gems and `debt = 0` still pays their agent rate through `drip` + `settle`.
 | `tag` | routing: `MTM`, `SDE`, `SAV`, `IDL`, `NIL` | — |
 | `till` | the Till that draws, pays and banks for this Tally | — |
 | `vault` / `buffer` (Till) | the prime's AllocatorVault / AllocatorBuffer | dss-allocator |
+| `tally` (Till) | the one contract that can make the Till pay (immutable) | — |
 | `pie` / `chi` | per gem: shares held / price per 1e18 shares (ray) | Pot / sUSDS |
 | `chi` (ilk) | sUSDS share price at last drip, the SSR index (wad) | Pot / sUSDS |
 | `art` / `usd` / `sus` | ilk debt, SubProxy USDS, SubProxy sUSDS value at last drip | Vat `art` |
@@ -284,7 +297,13 @@ Skybase, any prime whose demand side exceeds its Sky share) Sky's part comes
 from the pre-funded float, the on-chain form of the Demand-Side Buffer
 transfer in today's settlement transaction. If the float runs dry the balance
 is owed, not lost. `Till.quit` lets governance move the float, or anything
-else, out at any time.
+else, out at any time, and `Till.cage` disarms the money path while leaving
+`file`, `quit` and the views open so a caged instance can be unwound.
+
+**No stalling.** If the Till is unset, caged or unfunded, the day still
+closes: `zzz` advances, the Sky share and the demand side are carried, and
+nothing is drawn. The same rule as the debt ceiling, so a missing spell step
+delays payment instead of freezing the cycle.
 
 **Departure from the monthly identity.** The MSC nets a negative supply share
 inside the send (`send = dv + sv`). Done daily that is path-dependent: a loss
@@ -302,10 +321,12 @@ Sky's charge keeps accruing instead of the whole cycle reverting.
 `Till` needs the prime-scoped roles the ALM controller already holds:
 `AllocatorVault.draw` for its ilk and a USDS allowance from the
 AllocatorBuffer (`buffer.approve(usds, till, max)`; the audited buffer has
-no `withdraw`, only `approve`). `Tally` needs `Till.wards` to call `pay`,
-and nothing else. It
+no `withdraw`, only `approve`). Its `pay` is callable only by the immutable
+`tally`, so `Till.wards` can file, quit and cage but never spend; `Tally`
+needs no role on the Till at all. It
 holds no Vat authority. Governance holds `Tally.wards` for `init`, `file`,
-`gift`, `cage`, and tops up the USDS float for demand-side payments. The
+`gift`, `sort`, `cage`, and tops up the USDS float **on the Till**, which is
+the only contract that pays out. The
 hybrid process needs `gift` and `RelayPip.poke` only. `drip`, `poke`,
 `settle` are open.
 
@@ -379,9 +400,11 @@ made per chain and upgraded later without touching `Tally`.
 
 ## 4. Reference implementation
 
-- `src/Tally.sol`: the contract above.
+- `src/Tally.sol`: the books.
+- `src/Till.sol`: the cash register.
+- `src/TallyJob.sol`: the dss-cron job.
 - `src/Pips.sol`: the five adapters.
-- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 48 tests against mocks of Vat, AllocatorVault,
+- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: 54 tests against mocks of Vat, AllocatorVault,
   AllocatorBuffer, UsdsJoin, sUSDS, ERC-4626/7540 vaults and an aToken pool,
   covering rates, index PnL, haircuts, escrow, SDE caps, SAV and IDL rebates,
   subsidy, whole-USDS settlement with carries, the negative prime share, the
@@ -521,6 +544,15 @@ the drip interval. Obex backtest unchanged on the daily cadence.
 2026-09-08: `TallyJob` (dss-cron `IJob`) settles each instance once per UTC
 day; `zzz` records the last settle so relayer drips do not suppress it.
 Backtests for Osero and Grove added alongside Obex (§5).
+
+2026-09-11, code review: `Till.pay` is callable only by its immutable
+`tally` (a ward could previously draw the ilk's whole headroom to any
+address); `Till` gained `cage`, a re-issuable `approve`, constructor
+zero-checks and an `ilk()` check on the filed vault; `Settle` regained
+`kept` and `Pay` gained the ilk, payee and amounts; `file("alm")` now
+requires every gem poked and re-seeds the marks; `init` of a rebated gem
+requires a fresh drip; a missing or unfunded Till carries the day instead of
+reverting; `sub` cannot be zero. Docs and the deployment order corrected.
 
 2026-09-11: `Tally` / `Till` split. `Tally` keeps the books and holds nothing;
 `Till` holds the float and the allocator roles and executes `pay(drew, send,

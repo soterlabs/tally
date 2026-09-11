@@ -32,7 +32,7 @@ contract TallyJobTest is Test {
         MockAllocatorVault vault = new MockAllocatorVault(address(vat), address(join), ilk, address(buffer));
         vat.set(ilk, 1_000_000e18, RAY);
         t = new Tally(ilk, address(vat), address(usds), address(susds));
-        Till till = new Till(vow, address(join), address(usds));
+        Till till = new Till(address(t), vow, address(join), address(usds));
         till.rely(address(t)); vault.rely(address(till));
         buffer.approve(address(usds), address(till), type(uint256).max);
         till.file("vault", address(vault)); till.file("buffer", address(buffer));
