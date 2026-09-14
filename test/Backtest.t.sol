@@ -101,13 +101,38 @@ abstract contract ForkBase is Test {
         uint256 som;
         for (uint256 i = 0; i < ts.length; i++) som += ts[i].nav();
         console2.log("%s  SoM nav %s  debt %s", name, som / 1e18, _debt(ts) / 1e18);
+        _snapshot(ts, 0);
         for (uint256 d = 1; d < 32; d++) {
             _fork(d);
             for (uint256 i = 0; i < ts.length; i++) { ts[i].drip(); ts[i].poke(); }
+            _snapshot(ts, d);
         }
         uint256 eom;
         for (uint256 i = 0; i < ts.length; i++) eom += ts[i].nav();
         console2.log("%s  EoM nav %s  debt %s", name, eom / 1e18, _debt(ts) / 1e18);
+    }
+
+    // Machine-readable aggregate books. Grove has two ilks but only one
+    // demand-side payer; owe is already gated by each Tally's pay setting.
+    function _snapshot(Tally[] memory ts, uint256 day) internal view {
+        uint256 nav; uint256 tab; uint256 rebate; uint256 owe;
+        int256 gain; int256 sde; int256 gap;
+        for (uint256 i = 0; i < ts.length; i++) {
+            nav += ts[i].nav(); tab += ts[i].tab(); rebate += ts[i].rebate();
+            owe += ts[i].owe(); gain += ts[i].gain(); sde += ts[i].sde();
+            gap += ts[i].gap() + ts[i].flux() - ts[i].capital();
+        }
+        console2.log("BACKTEST_DAY", day);
+        console2.log("block", block.number);
+        console2.log("timestamp", block.timestamp);
+        console2.log("debt", _debt(ts));
+        console2.log("nav", nav);
+        console2.log("tab", tab);
+        console2.log("rebate", rebate);
+        console2.log("owe", owe);
+        console2.log("gain", gain);
+        console2.log("sde", sde);
+        console2.log("gap", gap);
     }
 
     function _debt(Tally[] memory ts) internal view returns (uint256 d) {
@@ -206,7 +231,7 @@ contract ObexForkTest is ForkBase {
 // Osero: SparkLend spUSDS (rebasing aToken) plus idle USDS, on the Diamond PAU
 // ALM Proxy. A 13M draw and deposit mid-month. The pipeline deducts the
 // prime's share of unborrowed USDS in the SparkLend pool ("lending idle")
-// from utilized; Tally charges the full ilk debt.
+// from utilized; Tally rebates that share with LendingIdlePip.
 // ---------------------------------------------------------------------------
 contract OseroForkTest is ForkBase {
     bytes32 constant ILK    = 0x414c4c4f4341544f522d505259534d2d41000000000000000000000000000000; // ALLOCATOR-PRYSM-A

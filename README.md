@@ -51,3 +51,22 @@ The [settlement simulation](reports/obex-settlement-2026-08.md) executes Tally
 and Till against historical market data with a persistent simulated cash/debt
 system. It preserves July's legacy settlement and also tests idempotent post-payment
 balance refreshes, the monthly settlement hook, and a closed debt ceiling with an exhausted float.
+
+Osero and Grove have reproducible August accrual examples too:
+
+```shell
+ETH_RPC=<archive rpc> python3 script/compare_backtest.py osero
+ETH_RPC=<archive rpc> python3 script/compare_backtest.py grove
+```
+
+See the [Osero comparison](reports/osero-2026-08.md),
+[Grove comparison](reports/grove-2026-08.md), and
+[Grove venue coverage and cross-chain proposal](docs/GROVE-CROSS-CHAIN.md).
+These replay historical Ethereum accruals, not daily payments. Grove's report
+explicitly separates its local subset from remote positions and cash income.
+Both commands accept `--log reports/<prime>-2026-08.log` to regenerate reports
+without RPC calls (the sibling pipeline checkout is still required).
+
+`forge test --match-contract CrossChainExampleTest -vv` runs a synthetic
+cash → transit claim → remote position → cash example using RelayPip,
+including yield, loss and stale-data behavior.
