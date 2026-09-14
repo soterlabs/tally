@@ -1,6 +1,7 @@
 # tally — Daily Settlement Cycle
 
 On-chain, daily counterpart of the Monthly Settlement Cycle (`../settlement-cycle`).
+Reference implementation for design review; not audited or deployed.
 
 - `DESIGN.md` — MSC ↔ DSC mapping, architecture, vocabulary, rates, settlement, hybrid boundary, open items.
 - `src/Tally.sol` — one instance per allocator ilk, `alm` / `sub` / `vault` / `buffer`
@@ -16,13 +17,37 @@ On-chain, daily counterpart of the Monthly Settlement Cycle (`../settlement-cycl
   joins Sky's net to the surplus buffer. `pay` is callable only by its immutable
   `tally`. No Vat privileges anywhere.
 - `src/TallyJob.sol` — dss-cron job: settles each instance once per UTC day, skipping any whose settle would revert.
-- `src/Pips.sol` — adapters: raw stablecoin, ERC-4626, ERC-7540, Aave/SparkLend aToken, Chronicle-priced,
+- `src/pips/` — individual adapters (`src/Pips.sol` preserves aggregate imports): raw stablecoin, ERC-4626, ERC-7540, Aave/SparkLend aToken, Chronicle-priced,
   lending idle share, Curve leg, Uniswap V3 positions, declared-capital (BUIDL-style yield), relayed.
-- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol` — 54 tests against mocks.
+- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol` — accounting and protocol tests against mocks.
+- `test/Accounting.t.sol` — settlement hooks, SAV neutrality, subsidy boundaries, configuration guards, and multi-cycle conservation fuzzing.
+- `test/PipConformance.t.sol` — shared adapter normalization, holder isolation and capital-flow checks.
+- [Adapter contract and integration guide](docs/ADAPTERS.md) — how to add a pip, choose tags, and bracket capital or monthly settlement movements.
 - `test/Backtest.t.sol` — mainnet fork backtests: Obex, Osero and Grove, August 2026, versus `settlement-cycle` (see `DESIGN.md` §5).
 
 ```shell
 forge build
-forge test                                                   # unit tests, mocks
+forge test --no-match-contract Fork                          # unit tests, mocks
 ETH_RPC=<archive rpc> forge test --match-contract Fork -vv       # August 2026 backtests against the MSC
 ```
+
+For Obex's August 2026 comparison against the local `../settlement-cycle`
+report, including daily observations and a breakdown of the differences:
+
+```shell
+ETH_RPC=<archive rpc> python3 script/compare_obex.py
+```
+
+See [the Obex comparison](reports/obex-2026-08.md). This replays daily accruals
+against historical balances; it does not execute daily settlement payments.
+
+To simulate the feedback from daily draws and payments, run:
+
+```shell
+ETH_RPC=<archive rpc> python3 script/simulate_obex.py
+```
+
+The [settlement simulation](reports/obex-settlement-2026-08.md) executes Tally
+and Till against historical market data with a persistent simulated cash/debt
+system. It preserves July's legacy settlement and also tests idempotent post-payment
+balance refreshes, the monthly settlement hook, and a closed debt ceiling with an exhausted float.

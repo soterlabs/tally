@@ -1,5 +1,8 @@
 # Tally
 
+Historical writeup at commit `7f88efa`. For current accounting semantics and
+reproducible Obex results, see `DESIGN.md` and `reports/obex-settlement-2026-08.md`.
+
 On-chain daily settlement for Sky prime agents. Replaces a monthly spreadsheet with one transaction a day.
 
 | | |
@@ -107,7 +110,7 @@ Written in the house style of Sky's core contracts.
 Four causes. Three are deliberate.
 
 1. **Daily vs monthly compounding.** The monthly cycle converts the Savings Rate assuming monthly capitalisation; Tally capitalises daily and converts daily. Every interest figure sits at 0.9987 of the monthly one. Over a year both charge the same.
-2. **Sampling at the interval's edges.** Balances are read at two points, not integrated. Tally takes the reading worse for the agent: larger debt, smaller credit. Accruing before drawing makes it exact; skipping that costs the agent, never Sky.
+2. **Sampling at the interval's edges.** Balances are read at two points, not integrated. Tally takes the reading worse for the agent: larger debt, smaller credit. Integrations must accrue and refresh before and after every movement; endpoint sampling alone can miss an intraday borrow-and-repay.
 3. **Flows priced at the closing index.** A mid-day deposit misses part of that day's yield. One day at a daily cadence; thirty at a monthly one.
 4. **Venues with no adapter.** The only real gap. A position on another chain contributes nothing until its values reach Ethereum.
 
