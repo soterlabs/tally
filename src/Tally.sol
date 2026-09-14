@@ -19,6 +19,8 @@
 
 pragma solidity ^0.8.21;
 
+import { PipLike } from "./pips/Pip.sol";
+
 interface VatLike {
     function ilks(bytes32) external view returns (uint256 Art, uint256 rate, uint256 spot, uint256 line, uint256 dust);
     function Line() external view returns (uint256);
@@ -26,6 +28,9 @@ interface VatLike {
 }
 
 interface TillLike {
+    function tally() external view returns (address);
+    function ilk() external view returns (bytes32);
+    function usds() external view returns (address);
     function pay(uint256 drew, uint256 send, address to) external returns (uint256 paid, uint256 kept);
 }
 
@@ -37,14 +42,6 @@ interface GemLike {
 interface SusdsLike {
     function balanceOf(address) external view returns (uint256);
     function convertToAssets(uint256 shares) external view returns (uint256);
-}
-
-/// Pricing adapter. Returns, for holder `who`:
-///   pie  shares held, incl. in-flight                     [wad]
-///   chi  price per 1e18 shares in the asset, gross of fees [ray]
-///   own  assets owned outside the shares (queued deposits) [wad]
-interface PipLike {
-    function peek(address who) external view returns (uint256 pie, uint256 chi, uint256 own);
 }
 
 /**
@@ -73,10 +70,10 @@ interface PipLike {
  *           taken on the balance that is WORSE for the prime over the
  *           interval: the larger of the debt at the two ends, the smaller
  *           of the SubProxy / rebated balances at the two ends. A prime
- *           that drips before it draws, wipes or moves funds is charged
- *           and credited exactly; one that does not pays for the interval
- *           at the higher balance. Nothing the prime does can under-charge
- *           Sky.
+ *           that drips before AND after every draw, wipe or transfer
+ *           records each interval exactly. Endpoint sampling alone cannot
+ *           detect a borrow-and-repay between observations. Integrations
+ *           must bracket every capital movement atomically.
  *
  *         - `poke(gem)` marks a position through its `pip` adapter and
  *           books `pie * (chi_new - chi_old)` as gain or loss. PnL is taken
@@ -119,7 +116,7 @@ contract Tally {
     // Where a gem's marks go.
     uint8 public constant MTM = 1; // prime mark-to-market                    -> gain
     uint8 public constant SDE = 2; // Sky direct exposure (cap-aware share)    -> sde, remainder -> gain; BR rebated on Sky's slice
-    uint8 public constant SAV = 3; // Sky savings token: SSR stays in the token; spread rebated   -> rebate
+    uint8 public constant SAV = 3; // debt-funded Sky savings token: index -> gain; spread -> rebate
     uint8 public constant IDL = 4; // idle USDS-equivalent, not utilized:      Base Rate rebated  -> rebate
     uint8 public constant NIL = 5; // position-only, tracked but never booked
 
@@ -155,7 +152,7 @@ contract Tally {
 
     // Equity layer: recognition of value that entered or left without a debt change
     int256  public flux;     // Σ gem flows since last settle: Δvalue − index PnL        [wad]
-    int256  public capital;  // Σ debt changes since last settle, less Tally's own draws [wad]
+    int256  public capital;  // Σ debt changes since last settle, less settlement draws [wad]
     int256  public gap;      // flux − capital, unrouted                                 [wad]
     uint8   public route;    // where a day's gap goes: MTM, SDE, or NIL = report and carry
 
@@ -179,6 +176,8 @@ contract Tally {
     mapping (address => Gem) public gems;
     address[]                public list;
 
+    mapping (bytes32 => uint256) public notes; // consumed external-settlement references
+
     uint256 public live;
 
     uint256 constant WAD  = 10 ** 18;
@@ -196,6 +195,7 @@ contract Tally {
     event Drip(uint256 debt, uint256 dchi, uint256 fee, uint256 agentRate, uint256 rebates);
     event Poke(address indexed gem, uint256 pie, uint256 chi, uint256 own, uint256 val, int256 dpnl);
     event Gift(uint256 wad);
+    event Note(bytes32 indexed ref, uint256 wad);
     event Settle(int256 sky, int256 sv, uint256 dv, uint256 mint, uint256 drew, uint256 send, uint256 paid, uint256 kept);
     event Gap(int256 flux, int256 capital, int256 gap, uint8 route);
     event Sort(int256 wad, uint8 to);
@@ -284,6 +284,7 @@ contract Tally {
     function file(bytes32 what, address data) external auth {
         require(live == 1, "Tally/not-live");
         if (what == "alm") {
+            require(block.timestamp == rho, "Tally/rho-not-updated");
             // The default holder of every gem: poke first so the open interval
             // is booked against the old holder, then re-seed every mark so the
             // move itself is not booked as PnL or paid out as an arrival.
@@ -296,7 +297,14 @@ contract Tally {
                 (g.pie, g.chi, g.own) = _read(list[k]);
             }
         }
-        else if (what == "till") till = data;
+        else if (what == "till") {
+            if (data != address(0)) {
+                require(TillLike(data).tally() == address(this), "Tally/wrong-tally");
+                require(TillLike(data).ilk() == ilk, "Tally/wrong-ilk");
+                require(TillLike(data).usds() == address(usds), "Tally/wrong-usds");
+            }
+            till = data;
+        }
         else if (what == "sub") {
             require(data != address(0), "Tally/no-payee");
             // Drip first so the old SubProxy's interval is credited to it.
@@ -315,7 +323,7 @@ contract Tally {
         require(live == 1, "Tally/not-live");
         Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
-        require(block.timestamp == g.rho, "Tally/rho-not-updated");
+        require(block.timestamp == rho && block.timestamp == g.rho, "Tally/rho-not-updated");
         if (what == "fee") {
             require(data <= WAD, "Tally/fee-too-high");
             g.fee = data;
@@ -331,12 +339,31 @@ contract Tally {
         require(live == 1, "Tally/not-live");
         Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
-        require(block.timestamp == g.rho, "Tally/rho-not-updated");
+        require(block.timestamp == rho && block.timestamp == g.rho, "Tally/rho-not-updated");
         if      (what == "pip") g.pip = data;
         else if (what == "who") g.who = data;
         else revert("Tally/file-unrecognized-param");
         (g.pie, g.chi, g.own) = _read(gem);
         emit File(gem, what, data);
+    }
+
+    /// @notice Classify a just-executed external settlement's debt increase.
+    ///         An authorized spell MUST call drip(), increase debt without
+    ///         funding the ALM, then note(ref), atomically in that order.
+    ///         No intervening drip or settle: the unsampled debt delta is the
+    ///         receipt. This is an attribution hook, not a payment or debt write.
+    ///         It does not remove this debt from the interest-bearing balance.
+    function note(bytes32 ref) external auth {
+        require(live == 1, "Tally/not-live");
+        require(block.timestamp == rho, "Tally/rho-not-updated");
+        require(ref != bytes32(0) && notes[ref] == 0, "Tally/bad-reference");
+        uint256 d = debt();
+        require(d > art, "Tally/no-settlement-debt");
+        notes[ref] = 1;
+        emit Note(ref, d - art);
+        // Do not add this delta to capital: no proceeds entered the ALM.
+        art = d;
+        (usd, sus) = _subs();
     }
 
     /// @notice Credit an off-chain demand-side amount (e.g. Distribution
@@ -401,11 +428,9 @@ contract Tally {
 
     // --- Sky side ---
 
-    /// @notice Accrue since the last drip, then re-sample. Calling `drip` in
-    ///         the same block as a draw, wipe or SubProxy transfer (before
-    ///         it) makes the accrual exact; the samples are always refreshed
-    ///         so a drip-then-move sequence starts the next interval on the
-    ///         post-move balance.
+    /// @notice Accrue since the last drip, then re-sample. Integrations call
+    ///         before AND after every draw, wipe or SubProxy transfer in one
+    ///         transaction. A same-block call refreshes without accruing.
     function drip() public {
         uint256 dt = block.timestamp - rho;
         uint256 d  = debt();
@@ -419,13 +444,7 @@ contract Tally {
 
             // Base Rate on the larger of the debt at both ends, subsidised up to `line`.
             uint256 base = _max(d, art);
-            uint256 fee;
-            if (line > 0) {
-                uint256 lo = _min(base, line);
-                fee = _rmul(lo, _ps(cut) * dt) + _rmul(base - lo, br);
-            } else {
-                fee = _rmul(base, br);
-            }
+            uint256 fee = _charge(base, dt, br);
             tab += fee;
 
             // Agent rate on the smaller of the SubProxy balances at both ends:
@@ -439,10 +458,10 @@ contract Tally {
                 owe += ar;
             }
 
-            // Rebates on the smaller of the tagged positions' values at both
-            // ends. SAV hands back the spread; IDL hands back what the
-            // marginal unit of debt pays. Bounded by `tab` at settle.
-            uint256 rb = _rebates(dt, br, (line > 0 && base <= line) ? _ps(cut) * dt : br);
+            // Rebates use the smaller endpoint position values. SAV returns
+            // the spread; IDL/SDE reduce the utilized principal across the
+            // entire subsidy curve. Bounded by `tab` at settle.
+            uint256 rb = _rebates(base, dt, br);
             rebate += rb;
 
             rho = block.timestamp;
@@ -456,20 +475,31 @@ contract Tally {
         sus = sv;
     }
 
-    // SAV hands back the spread. IDL hands back what the marginal unit of
-    // debt pays. SDE does the same on Sky's slice: Sky takes that slice's
-    // yield directly, so charging Base Rate on it would bill twice (the MSC
-    // excludes `sde_av` from utilized).
-    function _rebates(uint256 dt, uint256, uint256 marginal) internal view returns (uint256 rb) {
+    // Interest on a principal, applying the subsidy cap before full BR.
+    function _charge(uint256 principal, uint256 dt, uint256 br) internal view returns (uint256) {
+        uint256 lo = _min(principal, line);
+        return _rmul(lo, _ps(cut) * dt) + _rmul(principal - lo, br);
+    }
+
+    // Aggregate idle/Sky-direct deductions, then apply the SAME charge curve
+    // to the net principal. A single marginal rate is wrong if deductions
+    // cross the subsidy cap. SAV's spread credit is separate; settle caps the
+    // combined credit by accrued tab. Registration must avoid overlapping slices.
+    function _rebates(uint256 base, uint256 dt, uint256 br) internal view returns (uint256 rb) {
+        uint256 idle;
         uint256 spread = _ps(pad) * dt;
         for (uint256 k = 0; k < list.length; k++) {
             Gem storage g = gems[list[k]];
             if (g.tag != SAV && g.tag != IDL && g.tag != SDE) continue;
             (uint256 pie, uint256 chi_, uint256 own) = _read(list[k]);
             uint256 v = _min(_val(pie, chi_, own), _val(g.pie, g.chi, g.own));
-            if (g.tag == SDE && g.cap > 0) v = _min(v, g.cap);
-            rb += _rmul(v, g.tag == SAV ? spread : marginal);
+            if (g.tag == SAV) rb += _rmul(v, spread);
+            else {
+                if (g.tag == SDE && g.cap > 0) v = _min(v, g.cap);
+                idle += _min(v, base - idle);
+            }
         }
+        rb += _charge(base, dt, br) - _charge(base - idle, dt, br);
     }
 
     // --- Positions ---
@@ -486,6 +516,11 @@ contract Tally {
         Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
 
+        // Rebate samples belong to drip's interval, not to an arbitrary
+        // caller's mark cadence. Do not overwrite them before accruing.
+        if (g.tag == SAV || g.tag == IDL || g.tag == SDE) {
+            require(block.timestamp == rho, "Tally/rho-not-updated");
+        }
         (uint256 pie, uint256 chi_, uint256 own) = _read(gem);
         val = _val(pie, chi_, own);
         uint256 was = _val(g.pie, g.chi, g.own);
@@ -497,7 +532,7 @@ contract Tally {
         // items inside other holdings and NIL gems are outside the scope.
         if (g.tag != IDL && g.tag != NIL) flux += int256(val) - int256(was) - dpnl;
 
-        if (g.tag == MTM) {
+        if (g.tag == MTM || g.tag == SAV) {
             gain += dpnl;
         } else if (g.tag == SDE) {
             // Sky's share of the move: the whole position, or the capped
@@ -507,7 +542,7 @@ contract Tally {
             sde  += s;
             gain += dpnl - s;
         }
-        // SAV / IDL: rebated in drip; NIL: nothing booked.
+        // SAV also earns its spread rebate in drip; IDL / NIL book no PnL.
 
         g.pie = pie;
         g.chi = chi_;
@@ -577,7 +612,6 @@ contract Tally {
         // Draw within today's ceiling headroom; the rest waits on the Sky side.
         if (d.mint > 0) d.drew = _whole(_min(d.mint, room()));
         carry += int256(d.mint - d.drew);
-        capital -= int256(d.drew);   // this debt does not fund the ALM
 
         tab = 0; gain = 0; rebate = 0;
         sde = carry;
@@ -594,10 +628,16 @@ contract Tally {
             (d.paid, d.kept) = TillLike(till).pay(d.drew, d.send, sub);
         } else if (d.drew > 0) {
             sde += int256(d.drew);        // undo the carry deduction above
-            capital += int256(d.drew);    // ... and its capital exclusion
             d.drew = 0;
         }
         owe += d.send > d.paid ? d.send - d.paid : 0;
+
+        // Close the interval on POST-payment balances. Absorb the actual Vat
+        // debt delta, including vault rounding, without treating it as ALM
+        // capital. The next drip must neither rebook our draw nor miss the
+        // first day's agent rate on our own payout.
+        art = debt();
+        (usd, sus) = _subs();
 
         emit Settle(d.sky, d.sv, d.dv, d.mint, d.drew, d.send, d.paid, d.kept);
     }

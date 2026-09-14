@@ -52,6 +52,7 @@ contract ObexSettlementForkTest is ForkBase {
         uint256 legacySend;
     }
     Totals totals;
+    bool classifyLegacy;
 
     function setUp() public {
         rpc = vm.envString("ETH_RPC");
@@ -105,10 +106,17 @@ contract ObexSettlementForkTest is ForkBase {
         _fullyPaid();
     }
 
+    function test_obex_daily_settlement_noted() public {
+        classifyLegacy = true;
+        _runSettlement("noted", true, false, 0);
+        assertEq(totals.legacyDebt, 2_535_968e18);
+        assertEq(tally.notes("MSC-2026-07"), 1);
+        _fullyPaid();
+    }
+
     function test_obex_daily_settlement_refresh() public {
-        // Existing permissionless drip can refresh samples atomically after
-        // paying. This demonstrates the proposed integration without changing
-        // the production contracts or the on-chain SSR policy.
+        // Post-payment refresh is now automatic. An additional same-block
+        // drip must be idempotent and produce identical daily balances.
         _runSettlement("refresh", true, true, 0);
         _fullyPaid();
     }
@@ -144,8 +152,10 @@ contract ObexSettlementForkTest is ForkBase {
             if (include) {
                 // July's obligation is still due during August. Add it once,
                 // separately from the daily settlement of August's earnings.
+                if (classifyLegacy) tally.drip();
                 vat.frob(ILK, art - historicalDebt);
                 usds.mint(SUB, sub - historicalSub);
+                if (classifyLegacy) tally.note("MSC-2026-07");
                 totals.legacyDebt += art - historicalDebt;
                 totals.legacySend += sub - historicalSub;
             }
@@ -168,8 +178,10 @@ contract ObexSettlementForkTest is ForkBase {
             assertEq(ObexTokenLike(USDC).balanceOf(ALM), initialUsdc);
             assertEq(ObexTokenLike(USDS).balanceOf(ALM), 0);
             assertEq(ObexTokenLike(SUSDS).balanceOf(SUB), 0);
-            _legacy(day, legacy);
+            // The legacy hook can accrue before its debt change; measure the
+            // incoming carry before that accrual, not after it.
             uint256 carry = tally.owe();
+            _legacy(day, legacy);
             tally.drip();
             tally.poke();
             totals.fee += tally.tab();
@@ -186,7 +198,7 @@ contract ObexSettlementForkTest is ForkBase {
             if (refresh) tally.drip();
 
             assertEq(tally.sin(), 0, "Obex has positive daily supply PnL");
-            assertEq(tally.gap(), -int256(totals.legacyDebt), "own draws must not become equity losses");
+            assertEq(tally.gap(), classifyLegacy ? int256(0) : -int256(totals.legacyDebt), "own draws must not become equity losses");
             assertEq(tally.debt(), initialDebt + totals.legacyDebt + totals.drew);
             assertEq(usds.balanceOf(SUB), initialSub + totals.legacySend + totals.paid);
             assertEq(float + totals.drew, totals.paid + totals.kept + usds.balanceOf(address(till)));

@@ -44,7 +44,7 @@ def main():
         if run.returncode:
             raise RuntimeError('Settlement simulation failed; inspect the RPC connection and run forge locally.')
         log = (run.stdout + run.stderr).replace(os.environ['ETH_RPC'], '<ETH_RPC>')
-    names = ('legacy', 'refresh', 'ceiling')
+    names = ('legacy', 'refresh', 'noted', 'ceiling')
     for name in names:
         if f'[PASS] test_obex_daily_settlement_{name}()' not in log:
             raise ValueError(f'Missing passing {name} simulation')
@@ -75,7 +75,7 @@ def main():
                     scenario[key] = int(value)
     assert set(scenarios) == set(names)
     assert active is None
-    for scenario in scenarios.values():
+    for name, scenario in scenarios.items():
         assert [row['day'] for row in scenario['days']] == list(range(1, 32))
         for row in scenario['days']:
             assert row['debt'] == scenario['initial_debt'] + row['legacy_debt'] + row['drew']
@@ -84,7 +84,7 @@ def main():
             assert row['gain'] == row['drew'] + row['sde']
             assert row['gain'] + row['agent'] - row['fee'] == row['paid'] + row['owe']
             assert row['sin'] == 0
-            assert row['gap'] == -row['legacy_debt']
+            assert row['gap'] == (0 if name == 'noted' else -row['legacy_debt'])
 
     csv_rows = []
     for name in names:
@@ -94,7 +94,7 @@ def main():
                 **{key: value if key in ('day', 'block') else str(D(value) / WAD) for key, value in row.items()},
             })
     with (output / 'obex-settlement-2026-08-daily.csv').open('w', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=csv_rows[0].keys())
+        writer = csv.DictWriter(handle, fieldnames=csv_rows[0].keys(), lineterminator="\n")
         writer.writeheader()
         writer.writerows(csv_rows)
 
@@ -111,13 +111,13 @@ def main():
     for values in final.values():
         values['pnl'] = values['paid'] + values['owe']
     assert final['refresh']['fee'] == final['legacy']['fee']
-    assert final['refresh']['agent'] > final['legacy']['agent']
+    assert final['refresh'] == final['legacy'], 'extra drip must be idempotent'
     table = '\n'.join(
-        f'| {label} | {money(published)} | {money(final["legacy"][key])} | {money(final["refresh"][key])} |'
+        f'| {label} | {money(published)} | {money(final["legacy"][key])} | {money(final["noted"][key])} |'
         for label, key, published in comparisons
     )
     cash_table = '\n'.join(
-        f'| {label} | {money(final["legacy"][key])} | {money(final["refresh"][key])} | {money(final["ceiling"][key])} |'
+        f'| {label} | {money(final["legacy"][key])} | {money(final["noted"][key])} | {money(final["ceiling"][key])} |'
         for label, key in [
             ('August debt drawn', 'drew'), ('August paid to SubProxy', 'paid'),
             ('August joined to Vow', 'kept'), ('Closing debt', 'debt'),
@@ -140,14 +140,18 @@ The simulated ilk ceiling is initialized from July 31; other ilks are not modele
 
 ## Scenarios
 
-- **Current:** existing `settle()` behavior, zero initial float. Start at the
+- **Current:** updated `settle()` with automatic post-payment sampling, zero initial float. Start at the
   actual July 31 debt and SubProxy balance. Preserve the August 17 settlement
   of **July's** earnings: +2,535,968 debt and +916,736 SubProxy USDS, once.
   August's daily Tally draws/payments are additional, earned in August.
-- **Refresh:** same inputs, plus `drip()` immediately after each settlement,
-  in the same transaction. This updates debt/SubProxy samples after Till pays.
-  It demonstrates an integration improvement using existing public functions;
-  production contracts were not modified.
+- **Refresh:** same inputs with an additional `drip()` after settlement.
+  All final balances equal Current exactly, validating refresh idempotence.
+- **Noted:** the monthly integration brackets its debt increase and payment
+  with `drip(); ...; note("MSC-2026-07")`. The legacy event is modeled at
+  August 17's end-of-day timestamp, not its actual intraday execution time.
+  This demonstrates the hook, not intraday parity: it charges pre-event debt
+  for the preceding interval, unlike Current's larger-endpoint sampling.
+  Both scenarios keep the July obligation and charge it in later intervals.
 - **Ceiling stress:** no draw headroom, 20,000 USDS initial float, no legacy
   July settlement injected. This is a synthetic liquidity test, not a second
   historical August comparison. The float is exhausted on August {exhausted:02d};
@@ -159,24 +163,24 @@ They fail if those assumptions cease to hold.
 
 ## Results (USDS)
 
-| Accrual metric | Python monthly report | Current daily settlement | With post-payment refresh |
+| Accrual metric | Python monthly report | Current daily settlement | With monthly settlement hook |
 |---|---:|---:|---:|
 {table}
 
 The current daily-settlement net PnL differs from the Python report by
 {money(final['legacy']['pnl'] - D(pipeline['monthly_pnl']))} USDS.
-The refresh adds {money(final['refresh']['agent'] - final['legacy']['agent'])}
-USDS of agent-rate income. Its borrowing costs are unchanged: debt only grows
-in this simulation, so the larger endpoint debt already includes each prior draw.
-Paid balances then feed back into subsequent agent-rate accruals.
+The monthly-hook scenario changes net PnL by
+{money(final['noted']['pnl'] - final['legacy']['pnl'])} USDS because it brackets
+legacy debt at the modeled day-17 boundary. The unrelated extra-refresh
+scenario is exactly equal to Current.
 
 These figures differ from the [accrual-only replay](obex-2026-08.md), because
 daily draws and payments now remain in the next day's balances. No hypothetical
-new investments or discretionary withdrawals are modeled. Both normal scenarios
+new investments or discretionary withdrawals are modeled. All funded scenarios
 pay every whole-USDS claim and need no starting float for this profitable month;
 that is not a general float-sizing result.
 
-| Cash and closing balances | Current | Refresh | Ceiling stress |
+| Cash and closing balances | Current | Monthly hook | Ceiling stress |
 |---|---:|---:|---:|
 {cash_table}
 
@@ -197,12 +201,11 @@ August investment gain = draws + undrawn carry
 August gain + agent income - borrowing costs = payments + unpaid carry
 ```
 
-All three tests pass. Neither normal scenario has a supply loss; the existing
-unit suite covers negative-supply carries. The legacy equity gap remains
--2,535,968 USDS with `route = NIL`. It is the July settlement's debt movement,
-not an investment loss. Each Tally-owned daily draw is already excluded correctly.
-The proposed authorized legacy-settlement hook would remove this gap without
-removing the debt from the borrowing-cost base; that hook is not implemented here.
+All four tests pass. None of the funded scenarios has a supply loss; the existing
+unit suite covers negative-supply carries, including multi-cycle fuzz tests.
+Current retains the legacy equity gap at -2,535,968 USDS under `route = NIL`;
+Noted eliminates it without removing the legacy debt from the interest base.
+Tally's own daily draws are excluded in every scenario.
 
 Source: committed Python August `provenance.json`, SHA-256
 `{hashlib.sha256(raw).hexdigest()}`. Python was not regenerated.

@@ -107,7 +107,7 @@ def main():
         rows.append(row)
     assert abs(agent_monthly_rate - results['agent_rate']) < D('.01'), 'Agent baseline does not reproduce report'
     with (output / 'obex-2026-08-daily.csv').open('w', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys(), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 

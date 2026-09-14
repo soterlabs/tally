@@ -273,6 +273,7 @@ contract TallyTest is Test {
         vm.expectRevert("Tally/rho-not-updated");
         tally.file(address(sUsdc), "pip", address(sUsdcPip));
 
+        tally.drip();
         // Wrong adapter (par) corrected to the real one (1.05): no phantom PnL.
         tally.poke(address(usdc));
         tally.file(address(usdc), "pip", address(sUsdcPip));
@@ -322,17 +323,19 @@ contract TallyTest is Test {
         assertApproxEqAbs(tally.sde(), 398.02e18 - 18_000e18, 0.01e18);
     }
 
-    function test_sav_rebates_spread_on_lower_balance_and_ignores_appreciation() public {
+    function test_sav_rebates_spread_and_books_appreciation() public {
+        _debt(1_000_000_000e18);
         vm.warp(block.timestamp + 1 days);                   // sUSDS accrues a day of SSR
         tally.drip();
         tally.poke(address(susds));
-        assertEq(tally.gain(), 0);
+        assertEq(tally.gain(), int256(tally.value(address(susds))) - 420_000e18);
         // sUSDS: min(420,039.8, 420,000) * 0.002 / 365 = 2.3014
         // JTRSY (SDE): 200,000 * 1.0026384e-4 = 20.0528 of Base Rate handed back
         assertApproxEqAbs(tally.rebate(), 2.3014e18 + 20.0528e18, 1e15);
     }
 
     function test_idl_rebate_bounded_by_tab() public {
+        tally.file(address(susds), "tag", tally.NIL()); // isolate idle rebates from savings yield
         // 90M idle relayed, but the ilk has no debt: nothing was charged, nothing is rebated.
         RelayPip relay = new RelayPip();
         relay.poke(alm, 90_000_000e18, RAY, 0);
@@ -374,10 +377,10 @@ contract TallyTest is Test {
         relay.poke(alm, 500_000_000e18, RAY, 0);
         tally.drip();
         // Everything idle and everything subsidised: idle rebate == charge,
-        // 500M * 0.03 / 365; the extra is the sUSDS spread rebate (2.30) and
-        // the SDE slice's Base Rate at the subsidised rate (200,000 * 0.03 / 365 = 16.44).
+        // 500M * 0.03 / 365; overlapping excess SDE deductions cannot
+        // reduce net principal below zero. Only the savings spread remains.
         assertApproxEqRel(tally.tab(), 41_095.89e18, 1e13);
-        assertApproxEqAbs(tally.rebate() - tally.tab(), 2.3014e18 + 16.4384e18, 1e15);
+        assertApproxEqAbs(tally.rebate() - tally.tab(), 2.3014e18, 1e15);
     }
 
     function test_relay_pip_stale_mark_blocks_settlement() public {
@@ -517,14 +520,14 @@ contract TallyTest is Test {
     function test_index_pnl_plus_gap_equals_equity_delta() public {
         _borrow(1_000_000_000e18);
         tally.poke();
-        uint256 nav0 = tally.nav() - tally.value(address(susds));   // sUSDS accrues SSR on its own; keep it out
+        uint256 nav0 = tally.nav();   // SAV appreciation is included in both NAV and gain
         vm.warp(block.timestamp + 1 days);
         usdc.slash(alm, 5_000e6); sUsdc.mint(alm, 4_761_904_761);   // swap 5,000 USDC into sUSDC at 1.05
         sUsdc.setPps(1_060_000);                                    // then +1%
         tally.drip(); tally.poke();
-        uint256 nav1 = tally.nav() - tally.value(address(susds));
+        uint256 nav1 = tally.nav();
         // ΔNAV = -5,000 + 5,047.62 + 1,000 = 1,047.62 = index PnL (1,000) + gap (47.62)
-        assertApproxEqAbs(nav1 - nav0, 1_047.62e18, 0.01e18);
+        assertApproxEqAbs(nav1 - nav0, 1_047.62e18 + tally.value(address(susds)) - 420_000e18, 0.01e18);
         assertEq(tally.gain() + tally.flux() - tally.capital(), int256(nav1) - int256(nav0));
     }
 
@@ -548,7 +551,7 @@ contract TallyTest is Test {
         vm.warp(block.timestamp + 1 days);
         usdc.mint(alm, 3_400e6);             // 2,100 BUIDL dividend (Sky's) + 1,300 sweep (prime's)
         // Operator attributes the Sky part before the settle books the rest to the prime.
-        tally.poke();                        // realise today's flux
+        tally.drip(); tally.poke();          // accrue before replacing rebate samples
         tally.sort(2_100e18, tally.SDE());   // gap goes negative by 2,100 until settle nets flux in
         tally.settle();
         assertEq(tally.gap(), 0);
@@ -582,13 +585,13 @@ contract TallyTest is Test {
 
         // tab = 100,263.79  rebate = 2.30 (sUSDS spread) + 20.05 (BR on the SDE slice) = 22.36
         // sky = tab + 2,000 - rebate = 102,241.43 ; sv = 105,000 + rebate - tab = 4,758.57
-        // mint = 107,000.00 -> 107,000 ; dv = 3,007.91 ; send = 7,766.48 -> 7,766 (0.48 owed)
-        assertApproxEqAbs(vat.ilkDebt(ILK) - debtBefore, 107_000e18, 1e9);
-        assertEq(usds.balanceOf(sub) - 30_000_000e18, 7_766e18);
-        assertEq(join.credited(vow), (107_000e18 - 7_766e18) * RAY);
+        // SAV also earns 39.8094: mint floors to 107,039; send to 7,806.
+        assertApproxEqAbs(vat.ilkDebt(ILK) - debtBefore, 107_039e18, 1e9);
+        assertEq(usds.balanceOf(sub) - 30_000_000e18, 7_806e18);
+        assertEq(join.credited(vow), (107_039e18 - 7_806e18) * RAY);
         assertEq(usds.balanceOf(address(till)), 0);
         assertEq(tally.tab(), 0); assertEq(tally.gain(), 0); assertEq(tally.rebate(), 0); assertEq(tally.sin(), 0);
-        assertApproxEqAbs(tally.owe(), 0.48e18, 0.01e18);
+        assertApproxEqAbs(tally.owe(), 0.29e18, 0.01e18);
         assertGe(tally.sde(), 0); assertLt(tally.sde(), 1e18);
     }
 
@@ -601,11 +604,11 @@ contract TallyTest is Test {
         jtrsy.setPps(1_010_000);
         tally.settle();
 
-        // Wanted 107,000; room = 50,000 - 1 -> drew 49,999. Send is still paid in full.
+        // Wanted 107,039.8094; room = 50,000 - 1 -> drew 49,999. Send is still paid in full.
         assertApproxEqAbs(vat.ilkDebt(ILK), 1_000_049_999e18, 1e9);
-        assertEq(usds.balanceOf(sub) - 30_000_000e18, 7_766e18);
-        assertEq(join.credited(vow), (49_999e18 - 7_766e18) * RAY);
-        assertApproxEqAbs(tally.sde(), 57_001e18, 1e18);   // carried Sky share
+        assertEq(usds.balanceOf(sub) - 30_000_000e18, 7_806e18);
+        assertEq(join.credited(vow), (49_999e18 - 7_806e18) * RAY);
+        assertApproxEqAbs(tally.sde(), 57_040.81e18, 0.01e18);   // carried Sky share
 
         vat.setLine(ILK, type(uint256).max / 2);
         vm.warp(block.timestamp + 1 days);
@@ -629,8 +632,8 @@ contract TallyTest is Test {
         vm.warp(block.timestamp + 1 days);
         sUsdc.setPps(500_000);                    // -55,000 loss on 100,000 shares
         tally.settle();
-        // sv = -55,000 + 22.36 - 100,263.8 = -155,241.4 => carried
-        assertApproxEqRel(tally.sin(), 155_241.43e18, 1e13);
+        // sv includes +39.8094 SAV gain: loss carried is about 155,201.63
+        assertApproxEqRel(tally.sin(), 155_201.63e18, 1e13);
         assertEq(join.credited(vow), 100_241e18 * RAY);
         assertEq(usds.balanceOf(sub), 0);
 
@@ -663,6 +666,7 @@ contract TallyTest is Test {
     }
 
     function test_settle_sky_pays_from_float_when_send_exceeds_mint() public {
+        tally.file(address(susds), "tag", tally.NIL()); // isolate demand-side funding
         _fund(10_000_000e18);
         usds.mint(address(till), 5_000e18);
         vm.warp(block.timestamp + 1 days);
@@ -674,6 +678,7 @@ contract TallyTest is Test {
     }
 
     function test_settle_carries_unpaid_send_when_float_is_empty() public {
+        tally.file(address(susds), "tag", tally.NIL()); // isolate demand-side funding
         _fund(10_000_000e18);
         vm.warp(block.timestamp + 1 days);
         tally.settle();
@@ -806,7 +811,7 @@ contract TallyTest is Test {
 
     function test_file_alm_requires_pokes_and_reseeds() public {
         vm.warp(block.timestamp + 1 days);
-        vm.expectRevert("Tally/gem-rho-not-updated");
+        vm.expectRevert("Tally/rho-not-updated");
         tally.file("alm", address(0xA2));
 
         // A new, empty ALM: the whole NAV difference must not book as revenue.
