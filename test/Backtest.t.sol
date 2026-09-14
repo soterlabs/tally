@@ -159,7 +159,16 @@ contract ObexForkTest is ForkBase {
 
     function test_obex_august_2026() public {
         Tally[] memory ts = new Tally[](1); ts[0] = t;
-        _run(ts, "obex");
+        // Keep the deployed books/adapters across historical forks, but read
+        // each day's actual mainnet balances. This measures accrual parity;
+        // it does not simulate daily payments changing the historical debt.
+        _snapshotObex(0);
+        for (uint256 d = 1; d < 32; d++) {
+            _fork(d);
+            t.drip();
+            t.poke();
+            _snapshotObex(d);
+        }
         (uint256 tab, int256 gain,, uint256 owe,) = _report(ts, PIPE_SKY, PIPE_PRIME, 0, PIPE_AGENT);
 
         // Prime revenue is pure index PnL with no flows: to the cent.
@@ -169,6 +178,27 @@ contract ObexForkTest is ForkBase {
         // Agent rate: conversion frequency plus one day of the sampling rule on
         // the MSC#11 payment that landed at the SubProxy on Aug 17 (~92 USDS).
         assertApproxEqRel(owe, PIPE_AGENT * N_RATIO / 1e18, 0.0015e18);
+    }
+
+    // Full precision observations for reproducing the report comparison.
+    function _snapshotObex(uint256 day) internal view {
+        console2.log("OBEX_DAY", day);
+        console2.log("block", block.number);
+        console2.log("timestamp", block.timestamp);
+        console2.log("debt", t.debt());
+        console2.log("sub_usds", t.usd());
+        console2.log("sub_susds_value", t.sus());
+        console2.log("ssr_index", t.chi());
+        console2.log("nav", t.nav());
+        console2.log("syrup_value", t.value(SYRUP));
+        console2.log("alm_usds", t.value(USDS));
+        console2.log("alm_usdc", t.value(USDC));
+        console2.log("tab", t.tab());
+        console2.log("gain", t.gain());
+        console2.log("owe", t.owe());
+        console2.log("rebate", t.rebate());
+        console2.log("sde", t.sde());
+        console2.log("gap", t.gap() + t.flux() - t.capital());
     }
 }
 

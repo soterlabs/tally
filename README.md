@@ -26,3 +26,24 @@ forge build
 forge test                                                   # unit tests, mocks
 ETH_RPC=<archive rpc> forge test --match-contract Fork -vv       # August 2026 backtests against the MSC
 ```
+
+For Obex's August 2026 comparison against the local `../settlement-cycle`
+report, including daily observations and a breakdown of the differences:
+
+```shell
+ETH_RPC=<archive rpc> python3 script/compare_obex.py
+```
+
+See [the Obex comparison](reports/obex-2026-08.md). This replays daily accruals
+against historical balances; it does not execute daily settlement payments.
+
+To simulate the feedback from daily draws and payments, run:
+
+```shell
+ETH_RPC=<archive rpc> python3 script/simulate_obex.py
+```
+
+The [settlement simulation](reports/obex-settlement-2026-08.md) executes Tally
+and Till against historical market data with a persistent simulated cash/debt
+system. It preserves July's legacy settlement and also tests post-payment
+balance refreshes and a closed debt ceiling with an exhausted float.
