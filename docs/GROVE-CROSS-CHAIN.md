@@ -8,8 +8,8 @@ the remote integrations are not implemented by this example. Ethereum cash
 attribution for E21/E38/E42 is now implemented through Cash and verified
 August receipt fixtures.
 
-This assessment uses the local `settlement-cycle/config/grove.yaml` and August
-2026 reports, not an independently verified inventory of today's deployments.
+This assessment uses the frozen MSC August 2026 reports and venue configuration
+packaged in `test/fixtures/msc`; it is not a current deployment inventory.
 The [backtest report](../reports/grove-2026-08.md) records source hashes and
 baseline discrepancies. The [coverage CSV](../reports/grove-2026-08-coverage.csv)
 classifies every revenue venue and display-only holding in that snapshot.
@@ -92,16 +92,18 @@ or correction/finality mechanism. A fresh publication of old data passes its
 receipt-age check. The receiver and operational protocol above are necessary
 before using it as evidence for cross-chain settlement.
 
-CapitalPip and UniV3Pip have useful declaration hooks, but they are not generic
-cash-event classifiers. CapitalPip requires explicit initial capital and every
-subsequent capital movement; an undeclared inflow may be treated as yield, and
-a zero-share `own` balance does not automatically enter Tally's index PnL.
-UniV3Pip's collected-fee accumulator preserves revenue attribution, but is not
-live capital: if received cash is also marked, the cumulative collect credit
-must be reconciled to avoid inflating NAV. A dedicated receipt/realized-PnL
-ledger should keep revenue credits separate from spendable assets, with event
-references and reversals. This example does not change those contracts or
-claim that calling a hook alone closes all of Grove's gaps.
+CapitalPip requires explicit initial capital and subsequent capital movements;
+an undeclared inflow may be treated as yield, and a zero-share `own` balance
+does not automatically enter Tally's index PnL. Full exits preserve its index;
+zero-value recapitalization starts a fresh share series after marking the loss.
+
+UniV3Pip now values only live positions and accrued/owed fees. It has no cumulative
+collected-cash credit. Mark performance before each collection, liquidity/range
+change or reinvestment, then use `Tally.sync` after the operation and mark the
+received cash separately, atomically. This preserves earned fees without inflating
+NAV or diluting prior income on new capital. The August historical replay still
+samples LPs daily without reconstructing these operation hooks; its agreement
+with the saved MSC provenance is not evidence of a complete LP integration.
 
 Distribution rewards and Chronicle points remain separately attributed demand
 income. `gift` can credit approved amounts, but currently has no reference-based

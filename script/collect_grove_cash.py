@@ -32,11 +32,13 @@ def main():
         if 'error' in result:
             raise RuntimeError('RPC method failed')
         return result['result']
-    assert int(call('eth_chainId', []), 16) == 1
+    if not (int(call('eth_chainId', []), 16) == 1):
+        raise ValueError("collect_grove_cash.py: int(call('eth_chainId', []), 16) == 1")
     events = []
     seen = set()
     for venue, token, payer in SOURCES:
-        assert int(call('eth_call', [{'to': token, 'data': '0x313ce567'}, hex(25878704)]), 16) == 6
+        if not (int(call('eth_call', [{'to': token, 'data': '0x313ce567'}, hex(25878704)]), 16) == 6):
+            raise ValueError("collect_grove_cash.py: int(call('eth_call', [{'to': token, 'data': '0x313ce567'}, hex(25878704)]), 16) == 6")
         params = {'fromBlock':hex(25656293),'toBlock':hex(25878704),
                   'contractAddresses':[token],'fromAddress':payer,'toAddress':HOLDER,
                   'category':['erc20'],'excludeZeroValue':False,'maxCount':'0x3e8','withMetadata':True}
@@ -44,17 +46,25 @@ def main():
             result = call('alchemy_getAssetTransfers', [params])
             for item in result['transfers']:
                 receipt = call('eth_getTransactionReceipt', [item['hash']])
-                assert receipt['status'] == '0x1'
+                if not (receipt['status'] == '0x1'):
+                    raise ValueError("collect_grove_cash.py: receipt['status'] == '0x1'")
                 idx = int(item['uniqueId'].split(':log:')[1])
                 event = next(e for e in receipt['logs'] if int(e['logIndex'],16) == idx)
-                assert event['address'].lower() == token and event['topics'][0] == TRANSFER
-                assert '0x'+event['topics'][1][-40:] == payer
-                assert '0x'+event['topics'][2][-40:] == HOLDER
-                assert event['transactionHash'] == item['hash']
-                assert event['blockNumber'] == item['blockNum']
+                if not (event['address'].lower() == token and event['topics'][0] == TRANSFER):
+                    raise ValueError("collect_grove_cash.py: event['address'].lower() == token and event['topics'][0] == TRANSFER")
+                if not ('0x'+event['topics'][1][-40:] == payer):
+                    raise ValueError("collect_grove_cash.py: '0x'+event['topics'][1][-40:] == payer")
+                if not ('0x'+event['topics'][2][-40:] == HOLDER):
+                    raise ValueError("collect_grove_cash.py: '0x'+event['topics'][2][-40:] == HOLDER")
+                if not (event['transactionHash'] == item['hash']):
+                    raise ValueError("collect_grove_cash.py: event['transactionHash'] == item['hash']")
+                if not (event['blockNumber'] == item['blockNum']):
+                    raise ValueError("collect_grove_cash.py: event['blockNumber'] == item['blockNum']")
                 amount = int(event['data'],16)
-                assert amount == int(item['rawContract']['value'],16)
-                assert (item['hash'],idx) not in seen
+                if not (amount == int(item['rawContract']['value'],16)):
+                    raise ValueError("collect_grove_cash.py: amount == int(item['rawContract']['value'],16)")
+                if not ((item['hash'],idx) not in seen):
+                    raise ValueError("collect_grove_cash.py: (item['hash'],idx) not in seen")
                 seen.add((item['hash'],idx))
                 events.append({'venue':venue,'token':token,'payer':payer,'holder':HOLDER,
                                'block':int(item['blockNum'],16),'tx_hash':item['hash'],

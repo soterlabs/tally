@@ -39,6 +39,7 @@ contract CapitalPip is Pip {
 
     TokenLike public immutable gem;
     uint8     public immutable dec;
+    mapping (address => uint256) public chis;   // last nonempty index; retained across full exits
     mapping (address => uint256) public pies;   // declared capital, in index shares [wad]
 
     event Rely(address indexed usr);
@@ -54,7 +55,7 @@ contract CapitalPip is Pip {
 
     function _chi(address who, uint256 pie) internal view returns (uint256) {
         uint256 bal = _wad(gem.balanceOf(who), dec);
-        return pie == 0 ? RAY : bal * RAY / pie;
+        return pie == 0 ? (chis[who] == 0 ? RAY : chis[who]) : bal * RAY / pie;
     }
 
     /// @notice Declare a capital movement of `wad` assets (wad, signed) for
@@ -62,10 +63,13 @@ contract CapitalPip is Pip {
     function deal(address who, int256 wad) external auth {
         uint256 pie = pies[who];
         uint256 chi = _chi(who, pie);
+        require(chi > 0, "CapitalPip/zero-index");
+        chis[who] = chi;
         if (wad >= 0) pie += uint256(wad) * RAY / chi;
         else {
+            require(uint256(-wad) <= _wad(gem.balanceOf(who), dec), "CapitalPip/excess-withdrawal");
             uint256 d = uint256(-wad) * RAY / chi;
-            pie = d >= pie ? 0 : pie - d;
+            pie = uint256(-wad) == _wad(gem.balanceOf(who), dec) || d >= pie ? 0 : pie - d;
         }
         pies[who] = pie;
         emit Deal(who, wad, pie);

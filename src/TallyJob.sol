@@ -84,6 +84,9 @@ contract TallyJob is IJob {
     // --- Administration ---
     function add(address tally) external auth {
         require(has[tally] == 0, "TallyJob/already-added");
+        require(tally.code.length > 0, "TallyJob/no-code");
+        require(TallyLike(tally).live() <= 1, "TallyJob/bad-live");
+        TallyLike(tally).zzz();
         has[tally] = 1;
         list.push(tally);
         emit Add(tally);
@@ -129,7 +132,9 @@ contract TallyJob is IJob {
         if (!sequencer.isMaster(network)) return (false, bytes("Network is not master"));
         for (uint256 k = 0; k < list.length; k++) {
             address tally = list[k];
-            if (!due(tally)) continue;
+            try this.due(tally) returns (bool ready) {
+                if (!ready) continue;
+            } catch { continue; }
             try TallyLike(tally).settle() {
                 return (true, abi.encode(tally));
             } catch {

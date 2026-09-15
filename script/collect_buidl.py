@@ -50,7 +50,8 @@ def main():
     events = []
     running = opening = balance(START)
     for block in sorted({int(item['blockNum'], 16) for item in found.values()}):
-        assert balance(block - 1) == running, 'Unexplained balance change between discovered blocks'
+        if not (balance(block - 1) == running):
+            raise ValueError('Unexplained balance change between discovered blocks')
         logs = call('eth_getLogs', [{'address': TOKEN, 'fromBlock': hex(block),
                                     'toBlock': hex(block), 'topics': [TRANSFER]}])
         for event in sorted(logs, key=lambda e: int(e['logIndex'], 16)):
@@ -58,27 +59,34 @@ def main():
             if HOLDER not in (sender, recipient):
                 continue
             uid = event['transactionHash'] + ':log:' + str(int(event['logIndex'], 16))
-            assert uid in found
+            if not (uid in found):
+                raise ValueError('collect_buidl.py: uid in found')
             amount = int(event['data'], 16)
-            assert amount == int(found[uid]['rawContract']['value'], 16)
+            if not (amount == int(found[uid]['rawContract']['value'], 16)):
+                raise ValueError("collect_buidl.py: amount == int(found[uid]['rawContract']['value'], 16)")
             before = running
             delta = (amount if recipient == HOLDER else 0) - (amount if sender == HOLDER else 0)
             running += delta
             # Explicit August-only classification: all inflows are issuer
             # mints; the four outflows form two paired redemption transfers.
             if recipient == HOLDER:
-                assert sender == '0x' + '0' * 40 and amount < 1_000_000 * 10**6
+                if not (sender == '0x' + '0' * 40 and amount < 1_000_000 * 10**6):
+                    raise ValueError("collect_buidl.py: sender == '0x' + '0' * 40 and amount < 1_000_000 * 10**6")
                 kind = 'dividend_mint'
             else:
-                assert recipient == '0x8780dd016171b91e4df47075da0a947959c34200'
+                if not (recipient == '0x8780dd016171b91e4df47075da0a947959c34200'):
+                    raise ValueError("collect_buidl.py: recipient == '0x8780dd016171b91e4df47075da0a947959c34200'")
                 kind = 'capital_outflow'
             events.append({'block': block, 'log_index': int(event['logIndex'], 16),
                            'tx_hash': event['transactionHash'], 'from': sender, 'to': recipient,
                            'amount_raw': amount, 'kind': kind,
                            'balance_before_raw': before, 'balance_after_raw': running})
-        assert balance(block) == running, 'Logs do not reproduce block balance'
-    assert len(events) == len(found) == 25
-    assert balance(END) == running
+        if not (balance(block) == running):
+            raise ValueError('Logs do not reproduce block balance')
+    if not (len(events) == len(found) == 25):
+        raise ValueError('collect_buidl.py: len(events) == len(found) == 25')
+    if not (balance(END) == running):
+        raise ValueError('collect_buidl.py: balance(END) == running')
     result = {'token': TOKEN, 'holder': HOLDER, 'decimals': 6,
               'start_block': START, 'end_block': END, 'opening_balance_raw': opening,
               'closing_balance_raw': running, 'events': events}

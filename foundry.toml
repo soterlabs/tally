@@ -4,4 +4,17 @@ out = "out"
 libs = ["lib"]
 solc_version = "0.8.34"
 
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+optimizer = true
+optimizer_runs = 200
+evm_version = "cancun"
+
+[fmt]
+bracket_spacing = true
+line_length = 120
+multiline_func_header = "params_first"
+number_underscore = "preserve"
+
+# Retain correctness warnings; naming/gas suggestions conflict with Maker style.
+[lint]
+severity = ["high", "med", "low"]
+ignore = ["test/**", "lib/**"]

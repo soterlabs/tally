@@ -46,29 +46,13 @@ interface UniV3PoolLike {
     );
 }
 
-/// Uniswap V3 NFT positions of a holder in one stablecoin pool. Both tokens
-/// are valued at par. Value = amounts for the liquidity at the current price
-/// + fees owed + fees accrued since the position was last touched + fees
-/// already collected (declared with `deal`, since a collect moves value out
-/// of the position and would otherwise read as a loss).
-///
-/// The share is each position's NOTIONAL AT PARITY: the token amounts its
-/// liquidity would hold with the price exactly at 1. That is additive across
-/// positions with different tick ranges (raw liquidity is not: a wider range
-/// holds far more value per unit of liquidity), invariant to fee accrual and
-/// to price moves inside the range, and equal to the capital deposited for a
-/// stable pair near parity. Value per unit of notional is the index, so
-/// adding or removing liquidity is a flow and fee accrual is yield. When all
-/// liquidity is gone the residue is reported as `own`.
+/// Live value of Uniswap V3 positions in one equal-decimal stablecoin pool.
+/// Both tokens are valued at par. Collected cash is NOT part of this mark.
+/// Integrations MUST drip/poke before each collect, liquidity or range change,
+/// then Tally.sync after the operation in the same transaction. Otherwise a
+/// balance/index reader cannot distinguish fees from flows. No historical
+/// collection accumulator is used. Holder enumeration is limited to 32 NFTs.
 contract UniV3Pip is Pip {
-    mapping (address => uint256) public wards;
-    function rely(address usr) external auth { wards[usr] = 1; emit Rely(usr); }
-    function deny(address usr) external auth { wards[usr] = 0; emit Deny(usr); }
-    modifier auth {
-        require(wards[msg.sender] == 1, "UniV3Pip/not-authorized");
-        _;
-    }
-
     NPMLike        public immutable npm;
     UniV3PoolLike  public immutable pool;
     address        public immutable token0;
@@ -77,14 +61,8 @@ contract UniV3Pip is Pip {
     uint8          public immutable dec0;
     uint8          public immutable dec1;
 
-    mapping (address => uint256) public collected;   // fees collected out of the position [wad]
-
     uint256 constant Q96  = 2 ** 96;
     uint256 constant Q128 = 2 ** 128;
-
-    event Rely(address indexed usr);
-    event Deny(address indexed usr);
-    event Deal(address indexed who, uint256 wad);
 
     constructor(address npm_, address pool_) {
         npm    = NPMLike(npm_);
@@ -94,14 +72,7 @@ contract UniV3Pip is Pip {
         fee    = pool.fee();
         dec0   = TokenLike(token0).decimals();
         dec1   = TokenLike(token1).decimals();
-        wards[msg.sender] = 1;
-        emit Rely(msg.sender);
-    }
-
-    /// @notice Record fees collected out of the position (par, wad).
-    function deal(address who, uint256 wad) external auth {
-        collected[who] += wad;
-        emit Deal(who, wad);
+        require(dec0 == dec1, "UniV3Pip/mixed-decimals");
     }
 
     // --- math (Uniswap v3-core, 0.8 semantics) ---
@@ -220,6 +191,7 @@ contract UniV3Pip is Pip {
     function _sum(address who) internal view returns (uint256 v0, uint256 v1, uint256 N) {
         (uint160 sp, int24 tick) = _slot();
         uint256 n = npm.balanceOf(who);
+        require(n <= 32, "UniV3Pip/too-many-nfts");
         for (uint256 k = 0; k < n; k++) {
             (uint256 a, uint256 b, uint256 m) = _position(npm.tokenOfOwnerByIndex(who, k), sp, tick);
             v0 += a; v1 += b; N += m;
@@ -228,7 +200,7 @@ contract UniV3Pip is Pip {
 
     function peek(address who) external view override returns (uint256 pie, uint256 chi, uint256 own) {
         (uint256 v0, uint256 v1, uint256 N) = _sum(who);
-        uint256 val = _wad(v0, dec0) + _wad(v1, dec1) + collected[who];
+        uint256 val = _wad(v0, dec0) + _wad(v1, dec1);
         if (N == 0) return (0, RAY, val);
         pie = N;
         chi = val * RAY / N;

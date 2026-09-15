@@ -1,0 +1,29 @@
+name: Archive fork checks
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  forks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Configure this environment with a reviewer and ETH_RPC secret. Fork-PR
+    # code must never run with credentials before a maintainer reviews it.
+    environment: archive-forks
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.8.1
+      - name: Run forks and regenerate comparisons
+        env:
+          ETH_RPC: ${{ secrets.ETH_RPC }}
+        # Parsers suppress provider diagnostics that might contain the endpoint.
+        run: |
+          python3 script/check_permissions.py
+          python3 script/compare_obex.py --output /tmp/reports
+          python3 script/simulate_obex.py --output /tmp/reports
+          python3 script/compare_backtest.py osero --output /tmp/reports
+          python3 script/compare_backtest.py grove --output /tmp/reports

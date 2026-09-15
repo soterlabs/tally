@@ -6,7 +6,6 @@ python3 script/simulate_obex.py --log reports/obex-settlement-2026-08.log
 """
 
 import argparse
-import csv
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 import hashlib
 import json
@@ -14,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from reporting import BASELINE, Outputs, verify_baseline
 
 getcontext().prec = 60
 D = Decimal
@@ -28,10 +28,12 @@ def money(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--log', type=Path)
-    parser.add_argument('--pipeline', type=Path, default=ROOT.parent / 'settlement-cycle')
+    parser.add_argument('--pipeline', type=Path, default=BASELINE)
+    parser.add_argument('--output', type=Path, default=ROOT / 'reports')
     args = parser.parse_args()
-    output = ROOT / 'reports'
-    output.mkdir(exist_ok=True)
+    verify_baseline(args.pipeline)
+    outputs = Outputs(args.output)
+    output = args.output
     if args.log:
         log = args.log.read_text()
     else:
@@ -44,11 +46,13 @@ def main():
         if run.returncode:
             raise RuntimeError('Settlement simulation failed; inspect the RPC connection and run forge locally.')
         log = (run.stdout + run.stderr).replace(os.environ['ETH_RPC'], '<ETH_RPC>')
+    if '[FAIL' in log:
+        raise ValueError('Failing simulation log')
     names = ('legacy', 'refresh', 'noted', 'ceiling')
     for name in names:
         if f'[PASS] test_obex_daily_settlement_{name}()' not in log:
             raise ValueError(f'Missing passing {name} simulation')
-    (output / 'obex-settlement-2026-08.log').write_text(log)
+    outputs.text('obex-settlement-2026-08.log', log)
 
     scenarios = {}
     active = None
@@ -60,7 +64,8 @@ def main():
                 raise ValueError('Duplicate scenario')
             scenarios[active] = {'days': []}
         elif line.startswith('OBEX_SIM_END '):
-            assert active == line.split()[1]
+            if not (active == line.split()[1]):
+                raise ValueError('simulate_obex.py: active == line.split()[1]')
             active = None
         elif active:
             match = re.fullmatch(r'([a-z_]+) (-?\d+)', line)
@@ -70,21 +75,35 @@ def main():
                 if key == 'day':
                     scenario['days'].append({'day': int(value)})
                 elif scenario['days']:
+                    if key in scenario['days'][-1]:
+                        raise ValueError(f'Duplicate simulation field: {key}')
                     scenario['days'][-1][key] = int(value)
                 else:
+                    if key in scenario:
+                        raise ValueError(f'Duplicate simulation header: {key}')
                     scenario[key] = int(value)
-    assert set(scenarios) == set(names)
-    assert active is None
+    if not (set(scenarios) == set(names)):
+        raise ValueError('simulate_obex.py: set(scenarios) == set(names)')
+    if not (active is None):
+        raise ValueError('simulate_obex.py: active is None')
     for name, scenario in scenarios.items():
-        assert [row['day'] for row in scenario['days']] == list(range(1, 32))
+        if not ([row['day'] for row in scenario['days']] == list(range(1, 32))):
+            raise ValueError("simulate_obex.py: [row['day'] for row in scenario['days']] == list(range(1, 32))")
         for row in scenario['days']:
-            assert row['debt'] == scenario['initial_debt'] + row['legacy_debt'] + row['drew']
-            assert row['sub'] == scenario['initial_sub'] + row['legacy_send'] + row['paid']
-            assert scenario['initial_float'] + row['drew'] == row['paid'] + row['kept'] + row['float']
-            assert row['gain'] == row['drew'] + row['sde']
-            assert row['gain'] + row['agent'] - row['fee'] == row['paid'] + row['owe']
-            assert row['sin'] == 0
-            assert row['gap'] == (0 if name == 'noted' else -row['legacy_debt'])
+            if not (row['debt'] == scenario['initial_debt'] + row['legacy_debt'] + row['drew']):
+                raise ValueError("simulate_obex.py: row['debt'] == scenario['initial_debt'] + row['legacy_debt'] + row['drew']")
+            if not (row['sub'] == scenario['initial_sub'] + row['legacy_send'] + row['paid']):
+                raise ValueError("simulate_obex.py: row['sub'] == scenario['initial_sub'] + row['legacy_send'] + row['paid']")
+            if not (scenario['initial_float'] + row['drew'] == row['paid'] + row['kept'] + row['float']):
+                raise ValueError("simulate_obex.py: scenario['initial_float'] + row['drew'] == row['paid'] + row['kept'] + row['float']")
+            if not (row['gain'] == row['drew'] + row['sde']):
+                raise ValueError("simulate_obex.py: row['gain'] == row['drew'] + row['sde']")
+            if not (row['gain'] + row['agent'] - row['fee'] == row['paid'] + row['owe']):
+                raise ValueError("simulate_obex.py: row['gain'] + row['agent'] - row['fee'] == row['paid'] + row['owe']")
+            if not (row['sin'] == 0):
+                raise ValueError("simulate_obex.py: row['sin'] == 0")
+            if not (row['gap'] == (0 if name == 'noted' else -row['legacy_debt'])):
+                raise ValueError("simulate_obex.py: row['gap'] == (0 if name == 'noted' else -row['legacy_debt'])")
 
     csv_rows = []
     for name in names:
@@ -93,10 +112,7 @@ def main():
                 'scenario': name, 'date': f'2026-08-{row["day"]:02d}',
                 **{key: value if key in ('day', 'block') else str(D(value) / WAD) for key, value in row.items()},
             })
-    with (output / 'obex-settlement-2026-08-daily.csv').open('w', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=csv_rows[0].keys(), lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(csv_rows)
+    outputs.csv('obex-settlement-2026-08-daily.csv', csv_rows)
 
     final = {name: {key: D(value) / WAD for key, value in scenarios[name]['days'][-1].items()} for name in names}
     source = args.pipeline / 'settlements/obex/2026-08/provenance.json'
@@ -110,8 +126,10 @@ def main():
     ]
     for values in final.values():
         values['pnl'] = values['paid'] + values['owe']
-    assert final['refresh']['fee'] == final['legacy']['fee']
-    assert final['refresh'] == final['legacy'], 'extra drip must be idempotent'
+    if not (final['refresh']['fee'] == final['legacy']['fee']):
+        raise ValueError("simulate_obex.py: final['refresh']['fee'] == final['legacy']['fee']")
+    if not (final['refresh'] == final['legacy']):
+        raise ValueError('extra drip must be idempotent')
     table = '\n'.join(
         f'| {label} | {money(published)} | {money(final["legacy"][key])} | {money(final["noted"][key])} |'
         for label, key, published in comparisons
@@ -215,7 +233,8 @@ See [daily balances](obex-settlement-2026-08-daily.csv),
 
 Reproduce: `ETH_RPC=<archive RPC> python3 script/simulate_obex.py`.
 '''
-    (output / 'obex-settlement-2026-08.md').write_text(text)
+    outputs.text('obex-settlement-2026-08.md', text)
+    outputs.commit()
     print(table)
     print('\n' + cash_table)
     print(f'\nReport: {output / "obex-settlement-2026-08.md"}')

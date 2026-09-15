@@ -46,7 +46,7 @@ abstract contract ForkBase is Test {
 
     // The backtests only drip and poke, but wire a Till anyway so a run that
     // calls settle() behaves as a deployment would (it needs the allocator
-    // roles, which a historical fork cannot grant).
+    // roles; PermissionsForkTest rehearses granting them on an isolated fork).
     function _new(bytes32 ilk, address alm, address sub, uint256 pay) internal returns (Tally t) {
         t = new Tally(ilk, VAT, USDS, SUSDS);
         Till till = new Till(address(t), VOW, USDS_JOIN, USDS);
@@ -463,7 +463,7 @@ contract GroveForkTest is ForkBase {
         // $500 of the pipeline's sum for the same six venues. The LP legs
         // alone are -49,861 vs -49,543: the pipeline figure predates its
         // fee-collection credit (the Aug 17 collect of ~61.6k reads as a
-        // loss to both until declared with UniV3Pip.deal).
+        // loss in the sampled replay; production collections require a pre-mark and Tally.sync).
         assertApproxEqAbs(gain - cashIncome, int256(PIPE_MARKED) + PIPE_LP, 500e18);
         assertEq(cashIncome, 1_555_389.16e18);
         console2.log("CASH_INCOME", cashIncome);

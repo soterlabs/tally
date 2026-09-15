@@ -6,7 +6,6 @@ python3 script/compare_backtest.py osero --log reports/osero-2026-08.log
 No transactions are submitted to a live network.
 """
 import argparse
-import csv
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 import hashlib
@@ -15,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from reporting import BASELINE, Outputs, verify_baseline
 
 ROOT = Path(__file__).resolve().parents[1]
 getcontext().prec = 60
@@ -44,13 +44,6 @@ def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-def write_csv(path, rows):
-    with path.open('w', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=rows[0].keys(), lineterminator='\n')
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 def observations(log, prime):
     if f'[PASS] test_{prime}_august_2026()' not in log or '[FAIL' in log:
         raise ValueError('Expected a passing, single-prime fork log')
@@ -78,8 +71,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('prime', choices=('osero', 'grove'))
     parser.add_argument('--log', type=Path)
-    parser.add_argument('--pipeline', type=Path, default=ROOT.parent / 'settlement-cycle')
+    parser.add_argument('--pipeline', type=Path, default=BASELINE)
+    parser.add_argument('--output', type=Path, default=ROOT / 'reports')
     args = parser.parse_args()
+    verify_baseline(args.pipeline)
+    outputs = Outputs(args.output)
     prime = args.prime
     source = args.pipeline / 'settlements' / prime / '2026-08'
     raw = (source / 'provenance.json').read_bytes()
@@ -87,8 +83,7 @@ def main():
     report = json.loads(raw)
     if report['prime_id'] != prime or report['month'] != '2026-08':
         raise ValueError('Wrong pipeline baseline')
-    out = ROOT / 'reports'
-    out.mkdir(exist_ok=True)
+    out = args.output
     if args.log:
         log = args.log.read_text()
     else:
@@ -101,19 +96,26 @@ def main():
         log = (run.stdout + run.stderr).replace(os.environ['ETH_RPC'], '<ETH_RPC>')
     snaps = observations(log, prime)
     first, last = snaps[0], snaps[-1]
-    assert first['block'] == report['pin_blocks_som']['ethereum']
-    assert last['block'] == report['pin_blocks_eom']['ethereum']
-    assert all(first[k] == 0 for k in ('tab', 'rebate', 'owe', 'gain', 'sde', 'gap'))
+    if not (first['block'] == report['pin_blocks_som']['ethereum']):
+        raise ValueError("compare_backtest.py: first['block'] == report['pin_blocks_som']['ethereum']")
+    if not (last['block'] == report['pin_blocks_eom']['ethereum']):
+        raise ValueError("compare_backtest.py: last['block'] == report['pin_blocks_eom']['ethereum']")
+    if not (all(first[k] == 0 for k in ('tab', 'rebate', 'owe', 'gain', 'sde', 'gap'))):
+        raise ValueError("compare_backtest.py: all(first[k] == 0 for k in ('tab', 'rebate', 'owe', 'gain', 'sde', 'gap'))")
     daily = report['sky_revenue_daily']
-    assert len(daily) == 31
+    if not (len(daily) == 31):
+        raise ValueError('compare_backtest.py: len(daily) == 31')
     rows = []
     for prev, curr, baseline in zip(snaps, snaps[1:], daily):
         date = datetime.fromtimestamp(curr['timestamp'], timezone.utc).date().isoformat()
-        assert date == baseline['date']
-        assert curr['timestamp'] > prev['timestamp'] and curr['block'] > prev['block']
+        if not (date == baseline['date']):
+            raise ValueError("compare_backtest.py: date == baseline['date']")
+        if not (curr['timestamp'] > prev['timestamp'] and curr['block'] > prev['block']):
+            raise ValueError("compare_backtest.py: curr['timestamp'] > prev['timestamp'] and curr['block'] > prev['block']")
         debt_diff = D(curr['debt']) / WAD - D(baseline['cum_debt'])
         # Grove's Dune debt source rounds at six decimals.
-        assert abs(debt_diff) < D('.01'), f'Debt mismatch on {date}'
+        if not (abs(debt_diff) < D('.01')):
+            raise ValueError(f'Debt mismatch on {date}')
         row = {'date': date, 'block': curr['block'], 'elapsed_seconds': curr['timestamp'] - prev['timestamp']}
         row.update({k: str(D(curr[k]) / WAD) for k in FIELDS if k not in ('block', 'timestamp')})
         for k in ('tab', 'rebate', 'owe', 'gain', 'sde'):
@@ -125,16 +127,19 @@ def main():
             row['pipeline_' + key] = baseline[key]
         row['pipeline_debt_difference'] = str(debt_diff)
         rows.append(row)
-    write_csv(out / f'{prime}-2026-08-daily.csv', rows)
-    (out / f'{prime}-2026-08.log').write_text(log)
+    outputs.csv(f'{prime}-2026-08-daily.csv', rows)
+    outputs.text(f'{prime}-2026-08.log', log)
     r = {k: D(v) for k, v in report['results'].items() if k != 'gar_basis'}
     t = {k: D(last[k]) / WAD for k in ('tab', 'rebate', 'gain', 'sde', 'owe', 'gap')}
     cost = t['tab'] - min(t['tab'], t['rebate'])
     pipeline_cost = r['sky_revenue'] - r['sde_revenue']
-    assert abs(sum(D(d['daily_sky_rev']) for d in daily) - pipeline_cost) < D('.01')
+    if not (abs(sum(D(d['daily_sky_rev']) for d in daily) - pipeline_cost) < D('.01')):
+        raise ValueError("compare_backtest.py: abs(sum(D(d['daily_sky_rev']) for d in daily) - pipeline_cost) < D('.01')")
     venues = report['venue_breakdown']
-    assert abs(sum(D(v['revenue']) for v in venues) - r['prime_agent_revenue']) < D('.01')
-    assert abs(sum(D(v['sd_revenue']) for v in venues) - r['sde_revenue']) < D('.01')
+    if not (abs(sum(D(v['revenue']) for v in venues) - r['prime_agent_revenue']) < D('.01')):
+        raise ValueError("compare_backtest.py: abs(sum(D(v['revenue']) for v in venues) - r['prime_agent_revenue']) < D('.01')")
+    if not (abs(sum(D(v['sd_revenue']) for v in venues) - r['sde_revenue']) < D('.01')):
+        raise ValueError("compare_backtest.py: abs(sum(D(v['sd_revenue']) for v in venues) - r['sde_revenue']) < D('.01')")
     extras = r['distribution_rewards'] + r['chronicle_points']
     pairs = [
         ('Prime investment revenue' + (' (Ethereum subset)' if prime == 'grove' else ''), t['gain'], r['prime_agent_revenue']),
@@ -180,60 +185,77 @@ def main():
                              'pipeline_prime_revenue': venue.get('revenue', 'excluded'),
                              'pipeline_sde_revenue': venue.get('sd_revenue', 'excluded'),
                              'pipeline_value_som': venue['value_som'], 'pipeline_value_eom': venue['value_eom']})
-        write_csv(out / 'grove-2026-08-coverage.csv', coverage)
+        outputs.csv('grove-2026-08-coverage.csv', coverage)
         groups = {}
         for venue in venues:
             group = COVERAGE[venue['venue_id']][0]
             groups[group] = groups.get(group, D(0)) + D(venue['revenue'])
         partition = '\n'.join(f'| {key} | {money(value)} |' for key, value in groups.items())
         local = groups['Ethereum marks'] + groups['Ethereum cash credited']
-        assert abs(t['gain'] - local) < D('500'), 'Local matched-scope revenue regression'
+        if not (abs(t['gain'] - local) < D('500')):
+            raise ValueError('Local matched-scope revenue regression')
         cash_raw = (ROOT / 'test/fixtures/grove-cash-2026-08.json').read_bytes()
         cash_fixture = json.loads(cash_raw)
         cash_events = cash_fixture['events']
-        assert cash_fixture['chain_id'] == 1
-        assert cash_fixture['start_block'] == first['block'] and cash_fixture['end_block'] == last['block']
-        assert len(cash_events) == len({(e['tx_hash'], e['log_index']) for e in cash_events}) == 4
+        if not (cash_fixture['chain_id'] == 1):
+            raise ValueError("compare_backtest.py: cash_fixture['chain_id'] == 1")
+        if not (cash_fixture['start_block'] == first['block'] and cash_fixture['end_block'] == last['block']):
+            raise ValueError("compare_backtest.py: cash_fixture['start_block'] == first['block'] and cash_fixture['end_block'] == last['block']")
+        if not (len(cash_events) == len({(e['tx_hash'], e['log_index']) for e in cash_events}) == 4):
+            raise ValueError("compare_backtest.py: len(cash_events) == len({(e['tx_hash'], e['log_index']) for e in cash_events}) == 4")
         actual_receipts = re.findall(
             r'CASH_RECEIPT\s*\n\s*(0x[0-9a-f]{64})\s*\n\s*cash_log_index (\d+)[^\n]*\n\s*cash_amount (\d+)', log)
-        assert [(tx, int(idx), int(wad)) for tx, idx, wad in actual_receipts] == [
-            (e['tx_hash'], e['log_index'], e['amount_raw'] * 10**12) for e in cash_events]
+        if not ([(tx, int(idx), int(wad)) for tx, idx, wad in actual_receipts] == [
+            (e['tx_hash'], e['log_index'], e['amount_raw'] * 10**12) for e in cash_events]):
+            raise ValueError("compare_backtest.py: [(tx, int(idx), int(wad)) for tx, idx, wad in actual_receipts] == [\n            (e['tx_hash'], e['log_index'], e['amount_raw'] * 10**12) for e in cash_events]")
         cash_total = sum(D(e['amount_raw']) / 10**e['decimals'] for e in cash_events)
         reported_cash = re.findall(r'^\s*CASH_INCOME (\d+)', log, re.M)
-        assert len(reported_cash) == 1 and D(reported_cash[0]) / WAD == cash_total
+        if not (len(reported_cash) == 1 and D(reported_cash[0]) / WAD == cash_total):
+            raise ValueError('compare_backtest.py: len(reported_cash) == 1 and D(reported_cash[0]) / WAD == cash_total')
         for venue_id in ('E21', 'E38', 'E42'):
             credited = sum(D(e['amount_raw']) / 10**e['decimals'] for e in cash_events if e['venue'] == venue_id)
-            assert credited == D(next(v['revenue'] for v in venues if v['venue_id'] == venue_id))
-        assert cash_total == groups['Ethereum cash credited']
+            if not (credited == D(next(v['revenue'] for v in venues if v['venue_id'] == venue_id))):
+                raise ValueError("compare_backtest.py: credited == D(next(v['revenue'] for v in venues if v['venue_id'] == venue_id))")
+        if not (cash_total == groups['Ethereum cash credited']):
+            raise ValueError("compare_backtest.py: cash_total == groups['Ethereum cash credited']")
         cash_rows = []
         for e in cash_events:
             day = next(day for day in range(1,32) if snaps[day-1]['block'] < e['block'] <= snaps[day]['block'])
-            assert day == int(e['timestamp'][8:10])
+            if not (day == int(e['timestamp'][8:10])):
+                raise ValueError("compare_backtest.py: day == int(e['timestamp'][8:10])")
             cash_rows.append({'date': e['timestamp'][:10], 'venue': e['venue'], 'block': e['block'],
                              'tx_hash': e['tx_hash'], 'log_index': e['log_index'],
                              'token': e['token'], 'amount_usds_at_par': str(D(e['amount_raw']) / 10**e['decimals'])})
-        write_csv(out / 'grove-2026-08-cash.csv', cash_rows)
+        outputs.csv('grove-2026-08-cash.csv', cash_rows)
         cash_table = '\n'.join(f"| {row['date']} | {row['venue']} | {money(row['amount_usds_at_par'])} | [transaction](https://etherscan.io/tx/{row['tx_hash']}) |" for row in cash_rows)
         fixture_raw = (ROOT / 'test/fixtures/buidl-2026-08.json').read_bytes()
         fixture = json.loads(fixture_raw)
         events = fixture['events']
-        assert fixture['start_block'] == first['block'] and fixture['end_block'] == last['block']
-        assert fixture['decimals'] == 6
+        if not (fixture['start_block'] == first['block'] and fixture['end_block'] == last['block']):
+            raise ValueError("compare_backtest.py: fixture['start_block'] == first['block'] and fixture['end_block'] == last['block']")
+        if not (fixture['decimals'] == 6):
+            raise ValueError("compare_backtest.py: fixture['decimals'] == 6")
         minted = sum(e['amount_raw'] for e in events if e['kind'] == 'dividend_mint')
         outgoing = [e for e in events if e['kind'] == 'capital_outflow']
-        assert fixture['closing_balance_raw'] - fixture['opening_balance_raw'] == minted - sum(e['amount_raw'] for e in outgoing)
+        if not (fixture['closing_balance_raw'] - fixture['opening_balance_raw'] == minted - sum(e['amount_raw'] for e in outgoing)):
+            raise ValueError("compare_backtest.py: fixture['closing_balance_raw'] - fixture['opening_balance_raw'] == minted - sum(e['amount_raw'] for e in outgoing)")
         # Guard the EoD staging assumptions baked into GroveForkTest. No
         # dividend may follow a capital outflow within either affected day.
         for day, expected in ((24, 50_000_000), (31, 25_000_000)):
             day_events = [e for e in events if snaps[day-1]['block'] < e['block'] <= snaps[day]['block']]
             flows = [e for e in day_events if e['kind'] == 'capital_outflow']
-            assert len(flows) == 2 and sum(e['amount_raw'] for e in flows) == expected * 10**6
-            assert max(e['block'] for e in day_events if e['kind'] == 'dividend_mint') < min(e['block'] for e in flows)
-        assert len(outgoing) == 4
+            if not (len(flows) == 2 and sum(e['amount_raw'] for e in flows) == expected * 10**6):
+                raise ValueError("compare_backtest.py: len(flows) == 2 and sum(e['amount_raw'] for e in flows) == expected * 10**6")
+            if not (max(e['block'] for e in day_events if e['kind'] == 'dividend_mint') < min(e['block'] for e in flows)):
+                raise ValueError("compare_backtest.py: max(e['block'] for e in day_events if e['kind'] == 'dividend_mint') < min(e['block'] for e in flows)")
+        if not (len(outgoing) == 4):
+            raise ValueError('compare_backtest.py: len(outgoing) == 4')
         observed_yield = re.findall(r'^\s*BUIDL_YIELD (-?\d+)(?:\s+.*)?$', log, re.M)
-        assert len(observed_yield) == 1, 'Requires updated CapitalPip replay'
+        if not (len(observed_yield) == 1):
+            raise ValueError('Requires updated CapitalPip replay')
         buidl_yield = D(observed_yield[0]) / WAD
-        assert abs(buidl_yield - D(minted) / 10**6) < D('.01')
+        if not (abs(buidl_yield - D(minted) / 10**6) < D('.01')):
+            raise ValueError("compare_backtest.py: abs(buidl_yield - D(minted) / 10**6) < D('.01')")
         buidl_pipeline = D(next(v['sd_revenue'] for v in venues if v['venue_id'] == 'E10'))
         buidl_flows = '\n'.join(f"| {e['block']} | {money(D(e['amount_raw']) / 10**6)} | [transaction](https://etherscan.io/tx/{e['tx_hash']}) |" for e in outgoing)
         scope = f'''
@@ -388,7 +410,7 @@ loss/profit routing. Neither example proves live allocator permissions or liquid
 {scope}
 ## Baseline integrity
 
-Baseline: `settlement-cycle/settlements/{prime}/2026-08/provenance.json`, generated
+Baseline: `test/fixtures/msc/settlements/{prime}/2026-08/provenance.json`, generated
 {report['generated_at_utc']}. The pipeline was not rerun or modified.
 Provenance SHA-256: `{digest(raw)}`.
 Summary SHA-256: `{digest(summary_raw)}`.
@@ -412,12 +434,13 @@ ETH_RPC=<archive-rpc> python3 script/compare_backtest.py {prime}
 python3 script/compare_backtest.py {prime} --log reports/{prime}-2026-08.log
 ```
 
-Uses the standard library and the sibling pipeline checkout (`--pipeline` to
-override). Validation checks the passing fork test, complete daily snapshots,
+Uses the standard library and packaged MSC fixtures (`--pipeline` selects an
+external MSC checkout instead). Validation checks the passing fork test, complete daily snapshots,
 boundary blocks, all dates and debt readings, and pipeline revenue/cost sums.
 See [daily data]({prime}-2026-08-daily.csv) and [fork output]({prime}-2026-08.log).
 '''
-    (out / f'{prime}-2026-08.md').write_text(text)
+    outputs.text(f'{prime}-2026-08.md', text)
+    outputs.commit()
     print(table)
     print(f'Report: reports/{prime}-2026-08.md')
 

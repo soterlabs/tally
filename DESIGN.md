@@ -1,612 +1,184 @@
-# DSC — Daily Settlement Cycle (on-chain)
+# Tally accounting design
 
-On-chain, daily version of the Monthly Settlement Cycle (MSC) that
-`../settlement-cycle` runs off-chain today. Written in Sky/Maker house style.
-Status: **design draft with a compiling, tested reference implementation.**
+This is the authoritative description of the current reference implementation.
+The MSC process remains the comparison baseline. Tally has not been independently
+audited or deployed to a live network. See [the discussion brief](docs/TALLY_DISCUSSION.md)
+for the proposed pilot and decisions still needed from Sky teams.
 
-Decisions taken so far (2026-09-07) are marked **[D]**; open items are in §5.
+## Components and authority
 
-## 1. What the MSC does today, and what DSC does instead
+One **Tally** holds the books for one allocator ilk. **Till** holds its USDS float
+and executes draws, prime payments and surplus joins. Till accepts payment
+instructions only from its immutable Tally; Tally and Till need no Vat wards.
+Till needs an ilk-scoped allocator draw capability and a buffer USDS allowance.
+Its administrative wards can configure or rescue funds, so they remain trusted.
 
-Each month, per prime (forum post MSC #12, August 2026):
+**Pips** implement `peek(holder) -> (pie, chi, own)`: normalized shares in wad,
+share price in ray, and separately owned fixed claims in wad. New venues normally
+add an adapter, with no protocol branch in Tally. This interface is a valuation
+contract, not proof of ownership, freshness, economic classification or completeness.
 
-```
-sky  = sky_revenue                                   Sky share
-dv   = agent_rate + distribution_rewards + ...       demand side
-sv   = prime_agent_revenue − (sky_revenue − sde)     prime supply share
-mint = sky + max(sv, 0)     "Mint X USDS debt in ALLOCATOR-*-A and transfer to surplus buffer"
-send = dv + sv              "Send Y USDS from surplus buffer to the SubProxy"
-```
+**Cash** references approved Ethereum receipts and classifies supply income.
+**TallyJob** proposes one settlement per UTC day through the keeper network.
+Permissionless `settle` itself has no daily limit. A failing due-read or settlement
+is skipped by the job; monitoring must detect books that are no longer advancing.
 
-DSC runs the same identity once a day, on-chain, with the inputs read from
-chain where they can be and pushed by governance or the hybrid process where
-they cannot.
+A prime with several ilks uses several Tallies, with exactly one paying the
+shared SubProxy's demand income. Positions and deductions must be assigned to
+their actual funding ilk without duplication. Grove's replay groups Ethereum
+positions for comparison; it is not a verified production funding-ilk map.
 
-| MSC term | Off-chain source today | DSC |
-|---|---|---|
-| `cum_debt` | `Vat.ilks(ilk).Art × rate` at EoD block | `debt(ilk)`, same read **[D]** |
-| Base Rate | `SSR_apr(n=12) + spread`, spread from config | `dchi + pad × dt/365d`, where `dchi` is the growth of the sUSDS share price over the interval **[D]** |
-| subsidy | SOFR ramp on first $1B | `cut` (rate) and `line` (cap), filed by governance **[D]** |
-| utilized deductions | idle USDS, PSM3 legs, lending-idle | **not on-chain**: most idle sits on other chains; deducted in the hybrid layer **[D]** |
-| `value_som/eom`, `period_inflow` | balance × unit price at pin blocks, Transfer-event flows | `poke`: index PnL `pie × Δchi`, flows fall out |
-| ERC-7540 escrow | `balanceOf + pendingRedeem + claimableRedeem` | `Erc7540Pip`, same, plus queued deposits at par |
-| redemption fees | none modelled (BUIDL $15k flat, heuristic) | per-gem `fee` haircut filed by governance **[D]** |
-| Aave / SparkLend rebasing | closed form over month boundaries | `ATokenPip`: `scaledBalanceOf × normalizedIncome` **[D]** |
-| SDE (fixed / capped) | `sky_direct_exposures.yaml`, daily value-weighted share | gem `tag = SDE`, optional `cap`, share resolved per poke |
-| sUSDS spread reimbursement | `value × spread/365` per day, reduces sky revenue | gem `tag = SAV`, `rebate` |
-| agent rate | SubProxy USDS × (SSR+20bps), sUSDS × 20bps, cost-basis principal | `drip`: same rates, sUSDS at current `convertToAssets` **[D]** |
-| distribution rewards | external xlsx | `gift(ilk, wad)` by an authorised hybrid process |
-| idle balances on L2s | deducted from utilized | relayed gems tagged `IDL`, Base Rate rebated on-chain; or `gift` **[D: hybrid]** |
-| mint | `vat.grab` + `vat.suck` in a spell | `AllocatorVault.draw(mint)`, pulled from the AllocatorBuffer by allowance, capped by ceiling headroom **[D]** |
-| send | USDS transfer from surplus buffer | paid out of the mint, shortfall from `Tally`'s own USDS; net `mint − send` joined to the Vow |
-| whole USDS | `round()` per prime | floor to whole USDS, fractions carried **[D]** |
-| negative Sky share | not addressed | carried forward in `sde` **[D]** |
+## Recognition and equity
 
-Facts from the off-chain pipeline that shaped the design:
+For each gem:
 
-- The BR charge is not accrued on-chain today; allocator ilks are capitalised
-  monthly by `grab`. `Tally.drip` is the missing Jug.
-- BR is a nominal APR (Rule 1, 2026-09-01). Accrual is linear between
-  settles; compounding happens only through capitalisation, which DSC does
-  daily. Hence the APY→APR conversion at `n = 365`. On-chain the cleanest
-  form is the sUSDS share price itself: its growth between two drips is the
-  SSR compounded per second over exactly that interval, every SP-BEAM change
-  included. Over one day that equals the `n = 365` slice; over a longer gap
-  it is what Sky actually paid on sUSDS, which is what Rule 1's neutrality
-  argument wants.
-- The 0.66 bps/yr settlement-lag residual the PRD attributes to monthly
-  cadence (`PRD.md:1332`) disappears by construction.
-- Grove's E9 phantom loss (−$22.5M, escrowed JTRSY shares) is why the 7540
-  adapter counts in-flight shares. The Spark MSC#11 restatement (+$667K
-  aToken yield) is why the aToken adapter uses the index directly.
-
-## 2. Architecture
-
-```
-                 ┌──────────────────────────────────────────────┐
-  keeper (daily) │ Tally  (one instance per allocator ilk)       │
-  ─ settle(ilk) ►│                                              │
-                 │  drip   debt×(Δchi+pad·dt) → tab; rebates     │──► Vat.ilks(ilk)
-                 │         SubProxy USDS/sUSDS × (Δchi+tip) → owe │──► sUSDS.convertToAssets, balances
-                 │  poke   Σ pip.peek(who) → gain / sde / rebate │──► Pips ──► vaults, aTokens
-                 │  settle sky, sv, mint, send (whole USDS)      │
-                 │         gap = flux − capital, routed          │
-  governance     │  init / file / gift / sort / rely / deny / cage│
-  ─────────────► └───────────────┬──────────────────────────────┘
-                                 │ till.pay(drew, send, sub)
-                 ┌───────────────▼──────────────────────────────┐
-                 │ Till  (one per Tally; holds the USDS float)   │
-                 │  draw within the ceiling                      │──► AllocatorVault
-                 │  pull the draw                                │──► AllocatorBuffer (allowance)
-                 │  pay the SubProxy                             │
-                 │  join Sky's net                               │──► UsdsJoin
-                 └──────────────────────────────────────────────┘
-                                   │ events: Drip, Poke, Gap, Settle, Pay
-                                   ▼
-                 settlement-cycle (hybrid: idle deductions, DR, off-chain venues)
+```text
+value = pie * chi / RAY + own
+index PnL = old pie * new chi / RAY - old pie * old chi / RAY
+flow = new value - old value - index PnL
+unresolved equity = gap + flux - capital
 ```
 
-**Deployment [D]:** Ethereum only for now (the ilks live there). One `Tally`
-plus one `Till` per allocator ilk: Spark, Bloom, Grove (Diamond PAU), Obex,
-Prysm. `Tally.ilk` and `Till.tally` are immutable; `alm`, `sub` and `till`
-are filed on the Tally, `vault` and `buffer` on the Till. The spell order is:
-deploy `Tally`, deploy `Till(tally, vow, join, usds)`, `till.file("vault"|"buffer")`, grant the Till `AllocatorVault.draw` and the
-buffer's USDS allowance, `tally.file("till", till)`, then the gems and rates.
-`Till` checks the filed vault's `ilk()` against its Tally's, so a
-cross-wired pair cannot be filed.
-A prime with two ilks (Grove) deploys two instances sharing `sub` and sets
-`pay = 1` on exactly one, so the agent rate on the shared SubProxy is paid
-once. Keel and Skybase have no ilk and no ALM positions; an instance with no
-gems and `debt = 0` still pays their agent rate through `drip` + `settle`.
+`capital` tracks observed debt changes, excluding Tally's own settlement draws
+and explicitly referenced external settlement debt. `flux` aggregates asset flows.
+At settlement, their difference enters `gap`. Default `route = NIL` carries that
+gap for review. Enabling automatic routing requires a complete, reconciled
+perimeter; missing remote assets or monthly debt attribution can otherwise become
+false investment losses.
 
-### 2.1 Vocabulary
-
-| Word | Meaning here | Precedent |
-|---|---|---|
-| `ilk` | the allocator ilk this instance settles (immutable) | Vat |
-| `alm` | ALM Proxy, default holder of the gems | — |
-| `sub` | SubProxy: paid at settle, earns the agent rate when `pay = 1` | — |
-| `pay` | 1 if this ilk carries the prime's demand side (agent rate, gifts) | — |
-| `gem` | a token position (USDS, sUSDC, JTRSY, spUSDS…) | Vat / Join |
-| `pip` | pricing adapter for a gem, `peek(who) → (pie, chi, own)` | Spot / OSM |
-| `who` | holder override for a gem (0 = `alm`) | — |
-| `tag` | routing: `MTM`, `SDE`, `SAV`, `IDL`, `NIL` | — |
-| `till` | the Till that draws, pays and banks for this Tally | — |
-| `vault` / `buffer` (Till) | the prime's AllocatorVault / AllocatorBuffer | dss-allocator |
-| `tally` (Till) | the one contract that can make the Till pay (immutable) | — |
-| `pie` / `chi` | per gem: shares held / price per 1e18 shares (ray) | Pot / sUSDS |
-| `chi` (ilk) | sUSDS share price at last drip, the SSR index (wad) | Pot / sUSDS |
-| `art` / `usd` / `sus` | ilk debt, SubProxy USDS, SubProxy sUSDS value at last drip | Vat `art` |
-| `own` | assets owned outside the shares (7540 deposit queue) | — |
-| `fee` | redemption haircut on vault value (wad) | — |
-| `cap` | SDE: Sky's capped slice (wad), 0 = whole | — |
-| `pad` | BR spread over SSR, annual nominal (ray) | — |
-| `tip` | agent-rate spread over SSR, annual nominal (ray) | Clipper `tip` (a payment) |
-| `cut` / `line` | subsidised BR (ray) / debt charged at `cut` (wad) | Vat `line` |
-| `rho` | last drip / last poke timestamp | Jug / Pot |
-| `tab` | BR charge accrued since last settle | Cat / Dog |
-| `owe` | demand side owed to the prime since last settle | — |
-| `gain` / `sde` / `rebate` | prime MTM / Sky-direct MTM / rebates (sUSDS spread, idle BR) | — |
-| `sin` | negative prime share carried forward | Vat / Vow |
-| `flux` / `capital` / `gap` | Σ gem flows / Σ debt changes less own draws / their difference, unrouted | — |
-| `route` / `sort` | default bucket for `gap` / attribute part of it | — |
-| `vow` | the surplus buffer | Vow |
-| `drip` / `poke` / `settle` / `gift` | accrue / mark / execute / credit off-chain DV | Jug / Spot / — / — |
-| `init` / `file` / `rely` / `deny` / `cage` / `live` | admin | everywhere |
-
-### 2.2 Rates
-
-All annual rates are **nominal** and applied as `rate / 365 days` per second.
-
-```
-dchi      = sUSDS.convertToAssets(1e18) / chi_prev − 1     SSR over the interval, as sUSDS compounded it
-br        = dchi + pad × dt / 365d                         Base Rate over the interval
-fee       = max(debt_now, debt_prev) × br                  (subsidy: min(·, line) × cut × dt/365d + rest × br)
-agentRate = min(usds_now, usds_prev) × (dchi + tip × dt/365d) + min(susds_now, susds_prev) × tip × dt/365d
-charge(D) = min(D, line) × cut × dt/365d + max(D - line, 0) × br
-idle      = capped sum of minimum endpoint IDL and SDE-slice values
-rebates   = charge(base) - charge(base - idle) + Σ SAV: min(val_now, val_prev) × pad × dt/365d
-```
-
-`file("pad"|"tip"|"cut"|"line"|"pay")` requires a drip and a poke of every
-gem in the same block, so no open interval is re-priced retroactively. The
-SSR leg needs no governance action at all: the sUSDS index already carries
-every SP-BEAM change, and a `drip` after a long gap prices each sub-period at
-the rate that was in force.
-
-**Sampling rule.** Debt and SubProxy balances are sampled at interval endpoints,
-not integrated from event history. The larger debt and smaller credit balance
-are used, but this cannot detect a loan drawn and repaid between observations.
-An integration must call `drip(); poke();` before and after capital movements,
-atomically. `poke` on SAV/IDL/SDE requires a fresh `drip` so it cannot replace
-an unaccrued rebate sample. Gem configuration and ALM changes also require a
-fresh `drip`; gem changes still require a fresh `poke`.
-
-`settle()` refreshes actual debt and SubProxy balances after Till pays, including
-vault rounding. Its own draws are not ALM capital. SubProxy sUSDS continues to
-earn the additional spread on current asset value, not historical cost basis.
-
-### 2.3 Positions
-
-`poke(ilk, gem)` reads `(pie, chi, own)` from the gem's `pip`, applies the
-`fee` haircut to `chi`, and books `dpnl = pie_old × (chi_new − chi_old)`:
-
-| tag | routing |
-|---|---|
-| `MTM` | `gain += dpnl` |
-| `SDE` | `share = cap == 0 ? 1 : min(1, cap / prior value)`; `sde += dpnl × share`; `gain += rest`. The share is taken on the value the move was measured on, so a crash or a full redemption never routes more than Sky's slice. `drip` also rebates the Base Rate on Sky's slice: Sky takes its yield directly, so charging BR on it would bill twice (the MSC excludes `sde_av` from utilized) |
-| `SAV` | debt-funded savings: `gain += dpnl`; `drip` rebates `min(value, prior value) × pad × dt/365d` |
-| `IDL` | no PnL; contributes to the net utilized deduction. The rebate is `charge(gross) - charge(net)`, including subsidy-cap crossings. The combined rebate is capped by `tab` at settlement |
-| `NIL` | nothing booked (Savings V2 position-only) |
-
-Adapters live in `src/pips/`; `src/Pips.sol` retains aggregate imports. The extension contract is documented in [ADAPTERS.md](docs/ADAPTERS.md).
-
-| pip | `pie` | `chi` | `own` |
+| Tag | Income | Borrowing treatment | NAV |
 |---|---|---|---|
-| `RawPip` | `balanceOf` | `RAY` | 0 |
-| `Erc4626Pip` | `balanceOf` | `convertToAssets(1 share)` | 0 |
-| `Erc7540Pip` | `share.balanceOf + pendingRedeem + maxMint` | same | `pendingDeposit + maxWithdraw` |
-| `ATokenPip` | `scaledBalanceOf` | `pool.getReserveNormalizedIncome(asset)` | 0 |
-| `ChroniclePip` | `balanceOf` | Chronicle `read()` (the pip must be `kiss`ed) | 0 |
-| `LendingIdlePip` | `balanceOf / totalSupply × underlying.balanceOf(aToken)` | `RAY` | 0 |
-| `CurveLegPip` | `lp.balanceOf` | `balances(i) / totalSupply`, times the leg's 4626 price if yield-bearing | 0 |
-| `UniV3Pip` | Σ positions' notional at parity | value (amounts + owed + accrued + declared collected fees) per unit of notional | residue when no liquidity |
-| `CapitalPip` | declared capital, as index shares | `balance / pie` | balance if nothing declared |
-| `RelayPip` | pushed by an authorised writer | pushed | pushed |
+| MTM | Prime gain/loss | Ordinary utilization | Included |
+| SDE | Sky yield up to configured cap; remainder to prime | Sky slice reduces utilization | Included |
+| SAV | Prime savings-token yield | Spread rebated | Included |
+| IDL | No index income; memorandum slice | Reduces utilization | Excluded |
+| NIL | No income or equity classification | No deduction | Included |
 
-`ChroniclePip` covers oracle-priced tranches (STAC; the JAAA / JTRSY fallback).
-`LendingIdlePip`, tagged `IDL`, is the MSC's "lending idle" deduction: the
-holder's share of underlying sitting unborrowed in a SparkLend / Aave pool.
-`CurveLegPip` is one gem per pool leg with the LP token as the share, so
-swap fees accruing to the reserves read as yield and a sUSDS leg can carry
-`SAV`. `UniV3Pip` enumerates the holder's NFTs in one pool and values them
-at par: amounts at the current price, fees owed, fees accrued since the last
-touch, and fees already collected. Raw liquidity is not a valid share unit
-across positions (a wider tick range holds far more value per unit of
-liquidity: the ALM's 4M add on Aug 20 raised liquidity 1.6% and value 16%),
-so the share is each position's notional at parity, the amounts it would
-hold with the price exactly at 1. A fee collect moves value out of the
-position and reads as a loss until the relayer declares it with `deal`, the
-same discipline as `CapitalPip`.
+`sort(signedAmount, MTM/SDE)` moves an amount from gap into the chosen income
+bucket. It is a trusted classification, not a transfer or proof of earnings.
+`gift(amount)` credits demand income and is not interchangeable with `sort`:
+supply losses do not offset demand claims. Cash wraps prime-side sort with
+transaction/log deduplication per Cash deployment. One authoritative attribution
+ledger must prevent duplicate recognition through other wrappers, index marks,
+direct sort, or automatic routing; corrections use a signed sort with evidence.
 
-`CapitalPip` is for yield that arrives as new tokens (BUIDL dividends) or as
-cash at the holder (issuer sweeps). A balance reader cannot tell a dividend
-from a deposit, so the party moving capital, the ALM controller or its
-relayer, calls `deal(who, ±wad)` in the same block before the transfer.
-Declared capital is kept as index shares at `chi = balance / pie`, so a
-declared flow leaves the index unchanged and an undeclared arrival raises it.
-This is the same discipline as `drip` before a draw; it is what replaces the
-pipeline's Transfer-log counterparty classification on-chain.
+## Rates, timing and flow hooks
 
-`Erc7540Pip` follows ERC-7575: the vault has no ERC-20 surface, balances and
-decimals come from `vault.share()`. Its four in-flight states are each priced
-at the price they actually have: pending redeems float with the index, fulfilled
-redeems are fixed assets (`maxWithdraw`), pending deposits are assets at par,
-fulfilled deposits are shares already minted (`maxMint`).
+`drip` reads the actual on-chain sUSDS index. It prices interval SSR growth plus
+a nominal annual spread divided by 365 days. The debt sample is the higher
+endpoint; demand and rebate balances use the lower endpoint. Subsidized debt
+is charged at `cut` up to `line`; the remaining debt receives the full base rate.
+IDL and SDE deductions reduce net utilized debt across that same subsidy curve.
+SAV additionally rebates the spread. Applied rebates cannot exceed accrued `tab`.
 
-`RelayPip` reverts on a mark older than `hop` (default one day, OSM-style), so a
-stale relay stops `settle` for the whole ilk rather than settling on old data.
+This prices the observed SSR index, but does not integrate changing balances.
+An intraday borrow-and-repay can disappear between observations. Integrations
+must atomically `drip; poke`, move capital, then `drip; poke`. Configuration
+changes require fresh samples so old intervals are not repriced retrospectively.
+Different permissionless call cadences also partition SSR growth differently;
+timing economics must be agreed before enabling payments.
 
-`RelayPip` is the extension point for positions that cannot be read on this
-chain (L2 ALM Proxies, PSM3 baskets, custodial NAVs): a bridge receiver, an
-oracle, or the hybrid process pokes it. Curve and Uniswap LP decomposition
-would be further pips; nothing in `Tally` changes.
+Some operations change an adapter's index without investment performance.
+For an LP collect, liquidity/range change or reinvestment, use:
 
-### 2.4 Equity layer: recognition on top of attribution
-
-The index method above is an attribution engine: it knows which venue earned
-what, and treats every balance change as a flow. It is therefore blind to
-yield that arrives as new tokens or cash (BUIDL dividends, issuer sweeps). The
-equity method reads the same gems the other way:
-
-```
-Σ Δvalue = Σ index PnL + Σ flows                        per poke: flow = Δvalue − dpnl
-flux     = Σ flows over the interval                    (IDL and NIL gems excluded)
-capital  = Σ Δdebt over the interval − Tally's own draws
-gap      = flux − capital
+```text
+drip(); poke();
+perform the LP operation and its cash transfers
+sync(lpGem, uniqueReference);
+drip(); poke();
 ```
 
-A draw or a wipe appears in both `flux` and `capital` and cancels; a move
-between two gems cancels inside `flux`. What survives in `gap` is value that
-entered the perimeter without a debt increase (a dividend, a sweep) or left it
-without a debt decrease (a bridge, a transfer out). Nothing new is read: the
-perimeter is the set of gems, so adding a chain is adding `RelayPip` gems and
-a bridge then cancels between the two sides.
+`sync` refreshes the LP mark and records its entire value delta as flow, preserving
+previously marked income. Received cash is marked separately, so internal transfers
+cancel in aggregate flux. It requires authorization, current timestamp samples and
+a nonzero one-use reference. Those guards cannot prove that the operator actually
+marked before the operation or that no profit was hidden; the integration must
+execute the sequence atomically. Ordinary price changes must use `poke`, not sync.
+UniV3Pip returns only live LP assets and fees; the former collected-fee accumulator
+has been removed. It supports equal-decimal stablecoin pairs at par and at most
+32 holder NFTs; unsolicited NFTs can still impair availability. Range changes and
+full exits require the same flow checkpoint.
 
-`gap` is published in the `Gap` event at every settle and routed by a filed
-`route`: `MTM` books it as prime revenue, `SDE` as Sky's, `NIL` reports and
-carries it. `sort(wad, to)` lets the operator attribute part of it (BUIDL
-dividends to `SDE`) before the default takes the rest. With `route = MTM` the
-settled total equals the equity delta exactly, and the index method's
-flow-timing approximation (one day's yield on a mid-interval flow) is
-absorbed rather than lost. `route` should be `NIL` for a prime whose
-perimeter is still open (Spark, Grove until the L2 relays land) and `MTM` for
-one whose perimeter is closed (Obex, Osero), where a non-zero `gap` is a
-leak or an unpriced venue and a zero `gap` is a daily correctness check.
+CapitalPip requires initial capital and each subsequent capital transfer to be
+declared with `deal` before tokens move. Full exits retain the last index, preserving
+earned profit or loss across re-entry. A total loss produces a zero index and rejects
+new declarations: mark the loss, replace with a fresh CapitalPip at the normal
+fresh configuration boundary, then declare new capital. This starts a new share
+series without reviving written-off shares. Undeclared receipts with no declared
+shares appear as `own`; they require explicit income attribution.
 
-### External monthly settlement debt
+## Settlement and monthly coexistence
 
-A monthly spell calls `drip()`, executes its debt increase and SubProxy payment,
-then calls authorized `note(ref)` in the same transaction. `note` reads the
-unsampled increase itself, updates debt/SubProxy samples, and does not book the
-increase as ALM capital. It neither mints nor forgives debt. It rejects stale
-accruals, duplicate/zero references, and absent positive debt deltas. A public
-`drip` between the draw and `note` consumes the delta and makes `note` revert;
-the integration must be atomic and must not interleave other capital movements.
-The ward attests the purpose; this is not a cryptographic proof of a spell.
-References are unique per Tally. Already settled historical gaps require an
-explicit governance reconciliation, not a retroactive `note`.
+Ignoring whole-USDS rounding and carries for readability:
 
-The monthly process must also subtract amounts already settled daily. The hook
-classifies debt; it does not deduplicate economic obligations across systems.
-
-### 2.5 Settlement: `Tally` decides, `Till` moves
-
-`settle()` on `Tally` is permissionless. It drips, pokes every gem, routes
-the gap, then:
-
-```
-rebate = min(rebate, tab)          never hand back more than was charged
-sky    = tab + sde − rebate
-sv     = gain + rebate − tab − sin_prev
-up     = max(sv, 0)
-mint   = floor(sky + up)           fraction, a negative total, and anything the
-                                   ceiling blocks carry in `sde`
-send   = floor(owe + up)           fraction carries in `owe`
-sin    = max(−sv, 0)               a supply loss waits for supply gains only
-drew   = min(mint, room)           room = ilk and global ceiling headroom, less 1 USDS
-
-till.pay(drew, send, sub)          Till: vault.draw(drew); pull from the buffer;
-                                   pay min(send, balance) to the SubProxy;
-                                   join(vow, drew − send)
-owe   += send − paid               what the Till could not pay is owed
+```text
+sky = tab + sde - capped rebate
+prime supply = gain + capped rebate - tab - prior supply loss
+mint = sky + max(prime supply, 0)
+send = demand owed + max(prime supply, 0)
 ```
 
-`Tally` holds the books and no tokens. `Till` holds the USDS float and the
-prime-scoped allocator roles, and only `Tally` may call `pay`. The split is
-the Vat / Vow shape: accounting in one immutable contract, cash in another,
-each auditable alone, no delegatecall and no shared storage. A prime with
-several ilks has one `Till` per `Tally`; the float is per prime and can be
-topped up on whichever `Till` pays the demand side.
+Draws are limited by ilk and global debt headroom. Till pays from available cash,
+including its float, and joins Sky's net to the surplus buffer. Unpaid prime
+claims remain in `owe`; negative supply income remains in `sin` against future
+supply income. Unfunded Sky claims and fractional amounts carry in the books.
+Post-payment debt and SubProxy samples are refreshed in the same transaction.
+The [Obex simulation](reports/obex-settlement-2026-08.md) checks the multi-day
+cash/debt feedback and conservation identities.
 
-This nets the two MSC legs: the prime's fresh debt pays the SubProxy directly
-and only Sky's net crosses into the Vow. When `send` exceeds the draw (Keel,
-Skybase, any prime whose demand side exceeds its Sky share) Sky's part comes
-from the pre-funded float, the on-chain form of the Demand-Side Buffer
-transfer in today's settlement transaction. If the float runs dry the balance
-is owed, not lost. `Till.quit` lets governance move the float, or anything
-else, out at any time, and `Till.cage` disarms the money path while leaving
-`file`, `quit` and the views open so a caged instance can be unwound.
+For an external monthly capitalization, atomically `drip`, execute the settlement
+debt increase without ALM investment funding, then `note(reference)`. This excludes
+the observed increase from investment capital, while retaining the debt for future
+interest. It does not net or cancel monthly payments: the MSC process must subtract
+obligations already settled by Tally. References prevent replay of a hook, not
+payment under a different reference.
 
-**Partial payment.** An unset or unfunded Till leaves amounts carried in `sde`
-and `owe`. A configured but caged Till, stale adapter, or failed external call
-reverts the transaction; the keeper skips it. No successful settlement is
-reported for unreadable positions or a failed money path.
+Prime investment revenue is already net of SDE income but before borrowing costs.
+Prime supply revenue subtracts net borrowing costs; Sky supply revenue includes
+those costs **plus** SDE income. Do not subtract total Sky revenue again from the
+prime-only investment figure. Generated reports identify saved MSC summary versus
+provenance discrepancies rather than silently mixing versions.
 
-**Departure from the monthly identity.** The MSC nets a negative supply share
-inside the send (`send = dv + sv`). Done daily that is path-dependent: a loss
-day eats the agent rate, and the recovery day mints the prime new debt to pay
-itself back. `Tally` instead carries the loss in `sin` and pays the demand
-side regardless.
+## Dependency failure and recovery
 
-**Debt ceiling.** `room()` reads the ilk `line` and the global `Line`. The
-draw is capped at whatever headroom exists and the remainder carries on the
-Sky side, so a prime at its AutoLine cap still gets its demand side paid and
-Sky's charge keeps accruing instead of the whole cycle reverting.
+A ward can `halt(gem)` without calling its pip. This freezes the last mark, forces
+NIL routing and blocks **all settlement** while any gem is halted. NAV can still
+be read but includes explicitly stale values; consumers must check `stops` and
+`stopped(gem)`. Quarantined gems earn no rebates during accrual, including the
+unobserved interval preceding halt. Other positions and gross interest continue.
 
-### 2.6 Permissions
+`mend(gem, replacementPip, reference)` closes accrual under that conservative
+policy, reads the replacement, and seeds its mark. For assets in the equity book,
+the entire replacement value difference enters unresolved `gap`, not index income.
+It preserves previous earnings, claims and flows. The last successful repair
+unblocks settlement; governance reviews the missing interval and uses signed sort
+for approved income/loss corrections. Missing rebates are not automatically restored.
+Multiple broken pips can be halted independently; a failed repair rolls back.
 
-`Till` needs the prime-scoped roles the ALM controller already holds:
-`AllocatorVault.draw` for its ilk and a USDS allowance from the
-AllocatorBuffer (`buffer.approve(usds, till, max)`; the audited buffer has
-no `withdraw`, only `approve`). Its `pay` is callable only by the immutable
-`tally`, so `Till.wards` can file, quit and cage but never spend; `Tally`
-needs no role on the Till at all. It
-holds no Vat authority. Governance holds `Tally.wards` for `init`, `file`,
-`gift`, `note`, `sort`, `cage`, and tops up the USDS float **on the Till**, which is
-the only contract that pays out. The
-hybrid process needs `gift` and `RelayPip.poke` only. `drip`, `poke`,
-`settle` are open.
+Recovery trusts governance valuation and classification. It does not establish
+that the replacement is correct or that all missing history has been recovered.
+Normal `file` freshness guards remain in force. `cage` is irreversible; it stops
+settlement and administration, while Till rescue remains available. A halt is the
+recoverable dependency response, not a replacement for a system shutdown.
 
-### 2.7 A moving `rate` on allocator ilks (not taken, for the record)
+## Evidence and remaining boundaries
 
-The alternative to `draw` was `vat.fold(ilk, vow, mint / Art)`, the Jug's
-own path. Its merits: interest is capitalised the way every other ilk does
-it, `Art × rate` reflects it instantly for every reader, no USDS moves for
-the Sky leg, and the AllocatorVault already prices `draw`/`wipe` off the live
-`rate` (Spark's ilk sits at ≈1.045 today, so nothing assumes 1.0). Its cost
-is that `Tally` becomes a Vat ward, the highest privilege in the system, for
-a keeper-triggered daily contract. Decision: `draw` via the allocator stack;
-the frozen-rate convention is not load-bearing and could be revisited.
+Current numerical results live in generated [Obex](reports/obex-2026-08.md),
+[Osero](reports/osero-2026-08.md), and [Grove](reports/grove-2026-08.md) reports.
+Their packaged MSC baselines include hashes, source revision and a minimal venue
+chain map. Saved-log regeneration is offline; new observations require archive RPC.
+A report's closeness to its baseline does not prove either accounting policy.
 
-### 2.8 Operations: `TallyJob`
+Tests cover settlement conservation, supply-loss carry, adapter lifecycle flows,
+async claim transitions, cash attribution, failed feeds and keeper isolation.
+The permissions fork rehearses actual allocator draw, buffer allowance, pay and
+surplus join using impersonated authorities on an isolated historical fork.
+That is not approval of production permissions or a deployed integration.
 
-`src/TallyJob.sol` is a dss-cron job for Sky's keeper networks. It holds the
-list of `Tally` instances and implements `IJob`:
-
-- `due(tally)`: the instance is live and a new UTC day has begun since its
-  last `settle` (`zzz`). `drip` moving `rho` does not count, so a relayer
-  drip before a draw never suppresses the day's settle.
-- `workable(network)`: false unless the network is the Sequencer's master;
-  otherwise the first due instance whose `settle` succeeds in simulation.
-  The trial `settle` runs inside the keeper's `eth_call`, so a stale relay
-  mark or a missing allocator role makes that instance skipped rather than
-  reported, and no keeper gas is burnt on a revert.
-- `work(network, args)`: master check, decode the instance, `ShouldNotTrigger`
-  unless it is listed and due, then `settle`. One instance per call; the
-  keeper loops until nothing is workable.
-
-Governance `rely`s on the job only to `add` / `remove` instances. `settle`
-stays permissionless, so the job is a convenience, not a gate: anyone,
-including the prime, can settle early or out of band.
-
-## 3. What stays off-chain (hybrid boundary)
-
-- Idle deductions from utilized (most sit on L2s) **[D]**: the on-chain BR
-  charge is on full `Art × rate`. Two ways to hand the idle share back, both
-  supported: (a) the hybrid process computes it and pays through `gift`;
-  (b) the L2 balances are relayed into a `RelayPip` per leg and tagged `IDL`
-  (idle USDS, PSM3 USDS leg), `SDE` (PSM3 USDC leg) or `SAV` (PSM3 sUSDS
-  leg), and `poke` rebates on-chain. See §3.1.
-- Anchorage (~$260M), Galaxy GACLO-1 ($50M): API-only or no NAV feed.
-- Distribution Rewards: external, credited through `gift`.
-- Subsidy reference rate (SOFR): governance files `cut`.
-- Cats G/H (gas, governance tokens): unpriced by decision.
-
-### 3.1 Getting L2 balances to mainnet
-
-Three ways to fill a `RelayPip`, in increasing trust-minimisation:
-
-1. **Operator relay.** The settlement-cycle pipeline already reads every L2
-   balance daily; it signs and pokes `(pie, chi, own)`. Same trust as today's
-   MSC, live in a week. Right first step.
-2. **Messaging bridge.** A tiny reporter contract on each L2 reads the local
-   ALM Proxy / PSM3 and forwards a message through LayerZero or CCTP-style
-   messaging (the ALM controllers already use both, and `xchain-helpers`
-   has forwarders and receivers for OP-stack, Arbitrum, AMB, LZ, CCTP).
-   Canonical L2→L1 bridges are too slow for a daily cycle (7-day windows on
-   OP-stack and Arbitrum), so this means a third-party messenger, or
-   Chronicle publishing the L2 reads as an oracle, which is the Sky-native
-   option.
-3. **Storage proofs.** OP-stack chains and Arbitrum post state roots to L1
-   roughly hourly; a `ProofPip` can verify the ALM's balance slot against
-   them with no operator and no messenger. Not available for Avalanche.
-   Highest assurance, most engineering.
-
-In every case the receiving side is the same `RelayPip`, so the choice can be
-made per chain and upgraded later without touching `Tally`.
-
-## 4. Reference implementation
-
-- `src/Tally.sol`: the books.
-- `src/Till.sol`: the cash register.
-- `src/TallyJob.sol`: the dss-cron job.
-- `src/pips/`: individual adapters and the shared `PipLike` ABI; `src/Pips.sol` is a compatibility import.
-- `test/Tally.t.sol`, `test/Pips.t.sol`, `test/TallyJob.t.sol`: tests against mocks of Vat, AllocatorVault,
-  AllocatorBuffer, UsdsJoin, sUSDS, ERC-4626/7540 vaults and an aToken pool,
-  covering rates, index PnL, haircuts, escrow, SDE caps, SAV and IDL rebates,
-  subsidy, whole-USDS settlement with carries, the negative prime share, the
-  float-funded demand side, gifts, permissionless settle, the
-  allocator-only privilege boundary, relay staleness, debt-ceiling carries,
-  the sampling rule, the four ERC-7540 in-flight states, cap-on-prior-value
-  SDE shares, gem re-basing, and `quit` after `cage`. The mocks match the real
-  AllocatorBuffer (approve only) and the ERC-7575 share layout.
-
-## 5. Backtests, August 2026
-
-`test/Backtest.t.sol` deploys `Tally` on a mainnet fork at the July 31
-end-of-day block (the pipeline's `pin_blocks_som`), makes it persistent, and
-walks the end-of-day block of every day of August calling `drip` and `poke`.
-Three primes, in increasing difficulty.
-
-```
-ETH_RPC=<archive mainnet rpc> forge test --match-contract Fork -vv
-```
-
-(Cold RPC cache: Obex 5 min, Osero 2 min, Grove 17 min. Warm: seconds.)
-
-### Obex: one venue (Maple syrupUSDC), no flows
-
-| | Tally (daily) | pipeline (monthly) | ratio |
-|---|---:|---:|---:|
-| prime revenue | 1,631,729.31 | 1,631,729.31 | exact, to the cent |
-| Sky share | 1,247,071.87 | 1,248,716.85 | 0.998683 |
-| agent rate | 75,136.44 | 75,327.60 | 0.997462 |
-
-### Osero: SparkLend spUSDS (rebasing aToken), 13M deposit mid-month
-
-Marked: spUSDS through `ATokenPip`, its unborrowed share through
-`LendingIdlePip` tagged `IDL`, idle USDS.
-
-| | Tally (daily) | pipeline (monthly) | ratio |
-|---|---:|---:|---:|
-| prime revenue | 5,557.81 | 5,557.82 | exact, to the cent |
-| Sky share, gross Base Rate on full debt | 11,333.36 | 11,348.31 (`daily_sky_rev_gross`) | 0.998683 |
-| lending-idle deduction | 3,785.64 | 4,342.64 (gross − net) | 0.872 |
-| Sky share, net | 7,547.71 | 7,005.67 | 1.077 |
-| agent rate | 31,098.68 | 31,140.91 | 0.998644 |
-
-The pipeline deducts the prime's share of USDS sitting unborrowed in the
-SparkLend pool from utilized (38% of the debt on day one). The gross charge
-matches to the conversion factor. The deduction is 13% short because the
-debt was drawn in steps (1M → 3M on Aug 17, 4M on Aug 18, … 14M) and on each
-step day the sampling rule charges the new debt while crediting the old idle
-share; the pipeline includes both from the same day. A relayer `drip` before
-each draw removes it, and the error is one-sided in Sky's favour.
-
-### Grove: two ilks, 5 chains, RWA tranches, LP, cash distributions, subsidy, SDE
-
-Marked: Ethereum venues with an adapter (aTokens, Morpho vaults, syrupUSDC,
-JAAA and JTRSY through the ERC-7540 adapter, STAC through `ChroniclePip`,
-Curve AUSD/USDC through two `CurveLegPip`s, Uniswap V3 AUSD/USDC through
-`UniV3Pip`, BUIDL at par, idle stables, sUSDS, alt-holder and escrow
-balances). Not marked: the EOA relay, AUSD incentive and Galaxy cash
-distributions, and every venue on Base, Avalanche, Plume and Monad.
-
-| | Tally (daily) | pipeline (monthly) | note |
-|---|---:|---:|---|
-| prime revenue, marked venues (E4, E6, E7, E8, E11, E12) | 1,033,916.91 | 1,034,235.44 | $319 apart |
-| of which LP (Curve E11 + Uniswap V3 E12) | −49,861.34 | −49,542.82 | pipeline figure predates its fee-collection credit; the Aug 17 collect (~61.6k) reads as a loss to both until declared |
-| prime revenue, all venues | 1,033,916.91 | 4,913,183.00 | the other 3.9M is cash distributions and four other chains |
-| SDE revenue, JTRSY | 2,507,334.74 | 2,507,613.29 | $279: fulfilled redeems at their fixed claim vs at NAV |
-| SDE revenue, BUIDL | 0 | 2,111,592.75 | yield arrives as mints; needs `CapitalPip` with declared flows |
-| Base Rate, gross on full debt | 8,593,819.39 | | 1B at the subsidised rate, the rest at BR |
-| SDE slice rebate | 4,849,390.77 | | Base Rate handed back on 1.57B of SDE assets |
-| Base Rate, net | 3,744,428.62 | 3,720,604.84 | 0.6%: sampling rule on the BUIDL redemption / debt wipe day |
-| agent rate | 78,036.49 | 78,320.96 | conversion factor plus the sampling rule on the Aug 17 payment |
-
-### The equity gap on the three runs
-
-| prime | `gap` for August | what it is |
-|---|---:|---|
-| Obex | −2,535,968 | exactly the MSC#11 capitalisation: 2,535,968 of new ilk debt on Aug 17 whose USDS went to Sky's surplus buffer, not the ALM. In the DSC that is Tally's own draw and is excluded; in the historical run it is the one debt change that funded nothing |
-| Osero | −262 | debt rose 13,001,497 while 13,001,234.84 reached SparkLend (the pipeline's `period_inflow`): the residue of the July capitalisation and draw rounding |
-| Grove | −13,064,716 | an open perimeter: Curve, AUSD and BUIDL redemptions bridged to other chains, the July capitalisation, and +3.4M of BUIDL dividends and cash sweeps that the index layer cannot see. `route` must stay `NIL` until Base, Avalanche and Plume are relayed in |
-
-For the two closed perimeters the gap is the settlement mechanics themselves
-and nothing else, which is the daily invariant the equity layer is for. For
-Grove it is the size of what is still off-chain.
-
-### What the three runs establish
-
-- **Position accounting is exact where the data is on-chain.** Every
-  ERC-4626, ERC-7540, aToken, oracle-priced, Curve and Uniswap V3 venue
-  reproduces the pipeline to the cent or within a day's yield on a mid-month
-  flow, across three primes and 27 venues. The aToken case is the one that
-  produced the +$667K MSC#11 restatement off-chain.
-- **The Sky share matches the pipeline's utilized base.** With the
-  lending-idle gem and the SDE rebate, Osero's and Grove's net Base Rate land
-  within 8% and 0.6% of the pipeline, and the whole residual is the sampling
-  rule on days with large same-block moves. It is one-sided in Sky's favour
-  and is removed by bracketing each draw/wipe with before-and-after accrual.
-- **Yield delivered as new tokens or cash** (BUIDL dividends, Galaxy and
-  Agora sweeps) is invisible to the index layer and visible to the equity
-  layer as `gap`, once the perimeter is closed. Attribution between Sky and
-  the prime still needs `sort` or `CapitalPip`.
-- **Cross-chain** is Grove's largest remaining gap (2.55M of 4.91M prime
-  revenue on Base, Avalanche and Plume) and is the operator-relay path
-  already agreed; it is also what closes the perimeter for the equity layer.
-  Uniswap V4 (Spark) needs the same adapter against the V4 PositionManager.
-
-## 6. Decisions log
-
-2026-09-14: retain the on-chain SSR index; refresh actual post-payment samples;
-classify external settlement debt with `note(ref)`; book debt-funded SAV index
-PnL; calculate IDL/SDE rebates using the net-utilized charge curve; require fresh
-accrual before rebate marks/configuration; validate the Till binding. Split pips
-into individual files, preserving imports, and add conformance/conservation tests.
-Earlier backtest figures below are historical snapshots; the reproducible Obex
-reports in `reports/` distinguish accrual replay from daily cash settlement.
-
-
-2026-09-07: daily capitalisation; charge on full `Art × rate`; subsidy filed
-by governance; `duty` from `sUSDS.ssr()`; adapter architecture; per-vault
-haircut; 7540 deposit queues at par; `SAV` tag; holder override; five tags;
-Ethereum only; one instance per ilk; settle through AllocatorVault + Buffer,
-no Vat privileges; negative Sky share carried; sUSDS agent rate on current
-value; whole-USDS floor with carries; **pre-funded USDS float** for Sky's
-out-of-pocket demand-side payments (topped up by governance, unpaid amounts
-carried in `owe`); **operator relay** for L2 balances now, via
-`RelayPip.poke` from the settlement-cycle pipeline, with a messaging bridge
-(LayerZero) and/or a Chronicle feed as the intended next step. Both future
-sources plug into the same `RelayPip` by being `rely`'d on it; nothing in
-`Tally` changes.
-
-2026-09-07, code review: settle pulls from the buffer with `transferFrom`
-(the real buffer has no `withdraw`); draws are capped by ceiling headroom and
-the rest carried; accruals sample the balance worse for the prime; IDL rebate
-at the marginal rate and bounded by `tab`; SDE share on prior value; every gem
-re-file requires a same-block poke and re-seeds; rate re-files require every
-gem poked; a supply loss never nets against the demand side; `quit` added;
-ERC-7540 adapter reads the ERC-7575 share and prices claimable legs at their
-fixed values; `cut == 0` no longer disables the subsidy (`line` is the switch).
-
-2026-09-07, later: the SSR leg reads the sUSDS share price (index) instead
-of the spot `ssr()`, so SP-BEAM changes inside an interval are priced
-exactly and a long gap compounds as sUSDS does; one instance per ilk with
-`ilk` immutable and `alm` / `sub` / `vault` / `buffer` filed; `pay` flag so
-a prime with two ilks pays the agent rate once; rebates accrue in `drip` on
-the drip interval. Obex backtest unchanged on the daily cadence.
-
-2026-09-08: `TallyJob` (dss-cron `IJob`) settles each instance once per UTC
-day; `zzz` records the last settle so relayer drips do not suppress it.
-Backtests for Osero and Grove added alongside Obex (§5).
-
-2026-09-11, code review: `Till.pay` is callable only by its immutable
-`tally` (a ward could previously draw the ilk's whole headroom to any
-address); `Till` gained `cage`, a re-issuable `approve`, constructor
-zero-checks and an `ilk()` check on the filed vault; `Settle` regained
-`kept` and `Pay` gained the ilk, payee and amounts; `file("alm")` now
-requires every gem poked and re-seeds the marks; `init` of a rebated gem
-requires a fresh drip; a missing or unfunded Till carries the day instead of
-reverting; `sub` cannot be zero. Docs and the deployment order corrected.
-
-2026-09-11: `Tally` / `Till` split. `Tally` keeps the books and holds nothing;
-`Till` holds the float and the allocator roles and executes `pay(drew, send,
-to)` on `Tally`'s instruction. Same public `settle()`, same tests, same
-backtest figures. Runtime size 22,233 → 20,900 bytes for `Tally`; the bulk
-of the remainder is the `file` overloads and revert strings, not settlement.
-A diamond was considered and rejected: pips are configured instances, not
-code, and Sky's contracts avoid delegatecall proxies by design.
-
-2026-09-10: equity layer added: `flux`, `capital`, `gap`, `route`, `sort`.
-Recognition of unlabelled arrivals (dividends, sweeps) without sender labels;
-attribution stays with the index tags and `sort`. `CapitalPip` is kept as an
-optional attribution aid.
-
-2026-09-09, later: `CurveLegPip` reworked (LP token as share) and wired into
-Grove; `UniV3Pip` written (notional-at-parity shares, declared fee collects)
-and wired. Grove's marked Ethereum revenue: 1,033,917 vs 1,034,235.
-
-2026-09-09: four adapters after the backtests: `ChroniclePip` (STAC),
-`LendingIdlePip` (the MSC's lending-idle deduction, tagged `IDL`),
-`CurveLegPip` (one gem per pool leg), `CapitalPip` (declared capital flows
-for BUIDL-style yield). `SDE` gems now rebate the Base Rate on Sky's slice,
-matching the MSC's exclusion of `sde_av` from utilized. `IDL` gems are memo
-items and are not added to NAV. Grove's marked Ethereum revenue rises to
-1,083,874 vs 1,083,778, and both Osero's and Grove's net Base Rate now
-reconcile to the pipeline's utilized base.
-
-Open: contract name (`Tally` stands; `Till` is the short alternative); float
-sizing and top-up cadence; integrating the ALM controller with before-and-after accrual/mark hooks
-around every capital movement.
+Remote marks still need source finality, source age, domain/sequence protection
+and bridge-transfer reconciliation. RelayPip only enforces local receipt age.
+Chronicle access permission is not a freshness policy. Par pricing does not model
+depegs; off-chain claims need approved valuations. Gas bounds, operational recovery,
+cash classification and independent security review remain release-to-production
+requirements. See [adapter integration requirements](docs/ADAPTERS.md) and the
+[release review disposition](docs/RELEASE-REVIEW.md).

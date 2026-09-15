@@ -7,7 +7,6 @@ Uses only the Python standard library; never sends transactions to mainnet.
 """
 
 import argparse
-import csv
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 import hashlib
@@ -16,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from reporting import BASELINE, Outputs, verify_baseline
 
 getcontext().prec = 60
 D = Decimal
@@ -30,13 +30,15 @@ def money(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--log', type=Path)
-    parser.add_argument('--pipeline', type=Path, default=ROOT.parent / 'settlement-cycle')
+    parser.add_argument('--pipeline', type=Path, default=BASELINE)
+    parser.add_argument('--output', type=Path, default=ROOT / 'reports')
     args = parser.parse_args()
+    verify_baseline(args.pipeline)
+    outputs = Outputs(args.output)
     source = args.pipeline / 'settlements/obex/2026-08/provenance.json'
     raw = source.read_bytes()
     report = json.loads(raw)
-    output = ROOT / 'reports'
-    output.mkdir(exist_ok=True)
+    output = args.output
     if args.log:
         log = args.log.read_text()
     else:
@@ -50,9 +52,9 @@ def main():
         if run.returncode:
             # Do not persist provider errors, which can contain credentials.
             raise RuntimeError('Obex fork test failed; inspect the RPC connection and run forge locally.')
-        (output / 'obex-2026-08.log').write_text(log)
+        outputs.text('obex-2026-08.log', log)
 
-    if '[PASS] test_obex_august_2026()' not in log:
+    if '[PASS] test_obex_august_2026()' not in log or '[FAIL' in log:
         raise ValueError('Expected a passing Obex fork test.')
     observations = []
     for line in log.splitlines():
@@ -63,18 +65,25 @@ def main():
         if key == 'OBEX_DAY':
             observations.append({'day': int(value)})
         elif observations:
+            if key in observations[-1]:
+                raise ValueError(f'Duplicate observation field: {key}')
             observations[-1][key] = int(value)
     if [row['day'] for row in observations] != list(range(32)):
         raise ValueError('Expected July 31 baseline and 31 daily observations.')
     first, last = observations[0], observations[-1]
-    assert first['block'] == report['pin_blocks_som']['ethereum']
-    assert last['block'] == report['pin_blocks_eom']['ethereum']
-    assert all(row['sub_susds_value'] == 0 for row in observations), 'Decomposition assumes USDS-only SubProxy'
+    if not (first['block'] == report['pin_blocks_som']['ethereum']):
+        raise ValueError("compare_obex.py: first['block'] == report['pin_blocks_som']['ethereum']")
+    if not (last['block'] == report['pin_blocks_eom']['ethereum']):
+        raise ValueError("compare_obex.py: last['block'] == report['pin_blocks_eom']['ethereum']")
+    if not (all(row['sub_susds_value'] == 0 for row in observations)):
+        raise ValueError('Decomposition assumes USDS-only SubProxy')
     daily = report['sky_revenue_daily']
-    assert len(daily) == 31
+    if not (len(daily) == 31):
+        raise ValueError('compare_obex.py: len(daily) == 31')
     results = {key: D(value) for key, value in report['results'].items() if key != 'gar_basis'}
     venue = report['venue_breakdown'][0]
-    assert D(venue['period_inflow']) == 0
+    if not (D(venue['period_inflow']) == 0):
+        raise ValueError("compare_obex.py: D(venue['period_inflow']) == 0")
 
     # Counterfactuals hold daily endpoint balances fixed while changing one
     # convention at a time: monthly -> daily rate, then conservative balance
@@ -86,12 +95,17 @@ def main():
     rows = []
     for previous, current, published in zip(observations, observations[1:], daily):
         date = datetime.fromtimestamp(current['timestamp'], timezone.utc).date().isoformat()
-        assert date == published['date']
-        assert D(current['debt']) / WAD == D(published['cum_debt'])
+        if not (date == published['date']):
+            raise ValueError("compare_obex.py: date == published['date']")
+        if not (D(current['debt']) / WAD == D(published['cum_debt'])):
+            raise ValueError("compare_obex.py: D(current['debt']) / WAD == D(published['cum_debt'])")
         # Obex has no idle/SDE deductions, subsidy, or savings-token rebates.
-        assert D(published['utilized']) == D(published['cum_debt'])
-        assert published['sub_apr'] is None
-        assert current['rebate'] == current['sde'] == 0
+        if not (D(published['utilized']) == D(published['cum_debt'])):
+            raise ValueError("compare_obex.py: D(published['utilized']) == D(published['cum_debt'])")
+        if not (published['sub_apr'] is None):
+            raise ValueError("compare_obex.py: published['sub_apr'] is None")
+        if not (current['rebate'] == current['sde'] == 0):
+            raise ValueError("compare_obex.py: current['rebate'] == current['sde'] == 0")
         apy = D(str(published['ssr_apy']))
         factor = (1 + apy) ** (D(1) / 365) - 1 + D('.002') / 365
         sky_daily_rate += D(current['debt']) / WAD * factor
@@ -105,11 +119,9 @@ def main():
             row['daily_' + key] = str(D(current[key] - previous[key]) / WAD)
         row['pipeline_daily_sky'] = published['daily_sky_rev']
         rows.append(row)
-    assert abs(agent_monthly_rate - results['agent_rate']) < D('.01'), 'Agent baseline does not reproduce report'
-    with (output / 'obex-2026-08-daily.csv').open('w', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=rows[0].keys(), lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
+    if not (abs(agent_monthly_rate - results['agent_rate']) < D('.01')):
+        raise ValueError('Agent baseline does not reproduce report')
+    outputs.csv('obex-2026-08-daily.csv', rows)
 
     gain, sky, agent = (D(last[key]) / WAD for key in ('gain', 'tab', 'owe'))
     comparisons = [
@@ -122,8 +134,10 @@ def main():
         ('Prime total net PnL', gain - sky + agent, results['monthly_pnl']),
     ]
     for label, tally, pipeline in comparisons[:3]:
-        assert abs(tally - pipeline) < D('.01'), f'{label} differs from current report'
-    assert last['gap'] == -(last['debt'] - first['debt']), 'Unexpected equity-gap attribution'
+        if not (abs(tally - pipeline) < D('.01')):
+            raise ValueError(f'{label} differs from current report')
+    if not (last['gap'] == -(last['debt'] - first['debt'])):
+        raise ValueError('Unexpected equity-gap attribution')
     table = '\n'.join(f'| {label} | {money(tally)} | {money(pipeline)} | {money(tally - pipeline)} |' for label, tally, pipeline in comparisons)
     changes = '\n'.join(
         f'- {row["date"]}: debt {money(row["debt"])} USDS; SubProxy {money(row["sub_usds"])} USDS.'
@@ -138,7 +152,7 @@ forks through block {last['block']} (August 31). Each day calls `drip()` and
 `poke()`. Positions: ALM USDS, USDC, and Maple syrupUSDC. Base and agent
 spreads: 20 bps; no subsidy, SDE, or rebates. Default gap route: NIL.
 
-Baseline: the committed Python [August report](../../settlement-cycle/settlements/obex/2026-08/summary.md)
+Baseline: the committed Python [August report](../test/fixtures/msc/settlements/obex/2026-08/summary.md)
 and its full-precision `provenance.json`, generated {report['generated_at_utc']}.
 Provenance SHA-256: `{hashlib.sha256(raw).hexdigest()}`.
 The Python pipeline was not regenerated.
@@ -193,7 +207,8 @@ agent-rate baseline. See [daily observations](obex-2026-08-daily.csv) and
 
 Reproduce from this repo with `ETH_RPC=<archive RPC> python3 script/compare_obex.py`.
 '''
-    (output / 'obex-2026-08.md').write_text(text)
+    outputs.text('obex-2026-08.md', text)
+    outputs.commit()
     print(table)
     print(f'\nReport: {output / "obex-2026-08.md"}')
 

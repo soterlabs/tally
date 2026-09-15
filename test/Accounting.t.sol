@@ -58,6 +58,18 @@ contract AccountingTest is Test {
         assertLe(address(till).code.length, 24_576);
     }
 
+    function test_gas_budget_for_32_simple_positions() public {
+        for (uint256 i=1;i<32;i++) {
+            MockToken token=new MockToken(18);
+            token.mint(ALM,100e18);
+            tally.init(address(token),address(new RawPip(address(token))),tally.MTM());
+        }
+        vm.warp(block.timestamp+1 days);
+        uint256 before=gasleft();
+        tally.settle();
+        assertLt(before-gasleft(),2_000_000);
+    }
+
     function test_actual_draw_rounding_is_not_capital() public {
         vat.set(ILK, 1_000_000_000e18, 1.01e27);
         tally.drip();
