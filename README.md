@@ -12,6 +12,8 @@ Reference implementation for design review; not audited or deployed.
   ilk debt through the AllocatorVault within the debt ceiling, pays the prime
   share to the SubProxy, and joins Sky's net to the surplus buffer. No Vat
   privileges.
+- `src/Cash.sol` — authorized, transaction/log-referenced cash attribution through
+  Tally's supply-income equity path; duplicate credits are rejected per deployment.
 - `src/Till.sol` — the cash register, one per Tally: holds the USDS float and the
   prime-scoped allocator roles; draws within the debt ceiling, pays the SubProxy and
   joins Sky's net to the surplus buffer. `pay` is callable only by its immutable
@@ -76,3 +78,11 @@ outflows reconstructed in [the transfer fixture](test/fixtures/buidl-2026-08.jso
 The updated report explains its dividend attribution and the Python pipeline's
 1,001 USDS transfer-threshold difference. To reverify the fixture against logs
 and historical balances, use `ETH_RPC=<alchemy-compatible rpc> python3 script/collect_buidl.py`.
+
+Grove's E21/E38/E42 cash receipts are credited through Cash, without adding a
+second asset or bypassing supply-loss carry. The [cash fixture](test/fixtures/grove-cash-2026-08.json)
+and [receipt CSV](reports/grove-2026-08-cash.csv) record the four verified receipts.
+Recollect with `ETH_RPC=<alchemy-compatible rpc> python3 script/collect_grove_cash.py`.
+`forge test --match-contract CashTest -vv` checks authorization, deduplication,
+reinvestment and supply-loss carry. Receipt classification remains a trusted
+operator responsibility; Cash itself does not verify transaction log proofs.

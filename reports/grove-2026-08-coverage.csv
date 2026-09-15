@@ -23,15 +23,15 @@ E18,ethereum,sUSDS raw / POL (ALM idle — Cat B 4626),Ethereum marks,Local adap
 E19,base,"Grove x Steakhouse USDC High Yield (Base, Morpho 4626)",Remote position,Relay finalized remote shares/queues; preserve index versus capital,306958.04074468424624081746,0E-20,74985592.29829087768504121011,78292572.65257983250114002757
 E23,base,"Steakhouse Prime Instant (Base, Morpho V2)",Remote position,Relay finalized remote shares/queues; preserve index versus capital,740172.6066971651380539121,0E-19,204310140.6956611719230765830,205050313.3023583370611304951
 E20,avalanche_c,Janus Henderson Anemoy AAA CLO (JAAA-avalanche),Remote position,Relay finalized remote shares/queues; preserve index versus capital,1143058.287367016000000000,0E-18,260731201.713696999250000000,261874260.001064015250000000
-E21,avalanche_c,Galaxy Arch CLO Token (GACLO-1),Remote position + Ethereum cash,Avalanche principal; classify Ethereum cash distributions,222936.27,0.00,27586956.3700,17907834.7900
+E21,avalanche_c,Galaxy Arch CLO Token (GACLO-1),Ethereum cash credited,Verified receipts attributed with Cash; Avalanche principal still absent,222936.27,0.00,27586956.3700,17907834.7900
 E22,plume,Anemoy Tokenized Apollo Diversified Credit Fund (ACRDX),Remote position,Relay finalized remote shares/queues; preserve index versus capital,133369.45379698104762790106,0E-20,32853651.73425009768553391523,20703791.96596750779042466108
 E24,ethereum,Steakhouse High Yield PYUSD (Morpho 4626),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
 E26,ethereum,PYUSD raw (ALM idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
 E27,base,USDC raw on Base (ALM idle),Remote position,Relay finalized remote shares/queues; preserve index versus capital,0,0,0,0
-E38,ethereum,Agora AUSD incentives (cash distribution to Grove Eth ALM),Ethereum cash attribution,Receipt visible locally; principal/revenue attribution required,857964.00,0.00,0,0
+E38,ethereum,Agora AUSD incentives (cash distribution to Grove Eth ALM),Ethereum cash credited,Verified August receipts attributed via Cash.sort; future classification requires review,857964.00,0.00,0,0
 E40,ethereum,USDS raw (Diamond PAU ALM idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
 E41,ethereum,JTRSY Basin escrow — USDS pending subscription (Diamond PAU),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0.00,0.00,1000000.00,12500000.00
-E42,ethereum,Galaxy Warehouse (off-chain facility — cash distribution to Grove Eth ALM),Ethereum cash attribution,Receipt visible locally; principal/revenue attribution required,474488.89,0.00,0,0
+E42,ethereum,Galaxy Warehouse (off-chain facility — cash distribution to Grove Eth ALM),Ethereum cash credited,Verified August receipts attributed via Cash.sort; future classification requires review,474488.89,0.00,0,0
 E33,monad,"Uniswap V3 AUSD/USDC pool (Monad, NFT positions)",Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,0,0
 E14,ethereum,AUSD raw (ALM idle),Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,0,0
 E36,ethereum,OOB principal via 0xd94f (relay to Monad ALM EOA → AUSD acquisition),Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,50001000.00,50001000.00

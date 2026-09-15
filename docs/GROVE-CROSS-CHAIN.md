@@ -4,7 +4,9 @@
 reads alone cannot establish every remote holding, pending transfer, or
 off-chain claim.** The current replay covers an Ethereum subset. Full coverage
 needs authenticated remote observations and explicit capital/cash attribution;
-those integrations are not implemented by this example.
+the remote integrations are not implemented by this example. Ethereum cash
+attribution for E21/E38/E42 is now implemented through Cash and verified
+August receipt fixtures.
 
 This assessment uses the local `settlement-cycle/config/grove.yaml` and August
 2026 reports, not an independently verified inventory of today's deployments.
@@ -21,8 +23,8 @@ classifies every revenue venue and display-only holding in that snapshot.
 | E19/E23 Base Morpho; E27 Base idle | Remote shares, balances and vault index | Relay authenticated remote state. An Ethereum bridge escrow balance does not establish Grove's current vault shares or yield. |
 | E20 Avalanche JAAA | Ethereum NAV feed; Avalanche holder balance | Keep the NAV local if appropriate; relay ownership and pending claims. A local price alone is insufficient. |
 | E22 Plume ACRDX | Ethereum price feed; remote shares and redemptions | Relay the remote position and distinguish actual redemption proceeds from indicative NAV. The pipeline config explicitly uses a separate redemption-pricing convention. |
-| E21 Avalanche GACLO | Remote principal; USDC distributions arriving on Ethereum | Relay principal and classify receipts into principal, yield and fees. Do not book a repayment as revenue. |
-| E38 Agora and E42 Galaxy Warehouse | Ethereum cash receipts; external attribution and, for E42, an off-chain facility claim | Receipt evidence does not prove the economic claim or income period. Add an authorized, referenced classifier and a valuation policy for the external claim. |
+| E21 Avalanche GACLO | Remote principal; USDC distributions arriving on Ethereum | August income receipts are credited through Cash. Remote principal and future principal/yield classification remain separate requirements. |
+| E38 Agora and E42 Galaxy Warehouse | Ethereum cash receipts; external attribution and, for E42, an off-chain facility claim | Cash now credits the verified August receipts once under the pipeline attribution policy. The off-chain claim, future receipt classification and income-period policy still require external evidence. |
 | E25/E33–E35 Monad and E36 relay principal | Remote/relay information | Python treats these as display-only in this snapshot. Preserve that scope explicitly; do not silently include their values in paying PnL or treat exclusion as proof they are riskless. |
 
 Some source-config comments predate the current entries (for example the
@@ -111,8 +113,10 @@ since that bypasses supply loss carry and changes payment semantics.
 
 BUIDL capital attribution is now reconstructed from 25 verified August
 transfers; see the report for the 1,001 USDS threshold difference with Python.
-To complete historical Grove coverage, reconstruct LP fee events, classify
-E21/E38/E42 receipts, then replay Base, Avalanche and
+E21/E38/E42 cash receipts are now verified and credited through Cash using
+transaction/log references; they no longer contribute to the prime-revenue
+coverage shortfall. To complete historical Grove coverage, reconstruct LP fee
+events, then replay Base, Avalanche and
 Plume from their pinned blocks with matched transfer references. Add remote
 queues, loss/recovery cases and cross-ilk reconciliation before simulating
 Till payments. Reconcile the source report versions first: the current summary
@@ -122,3 +126,37 @@ published target for those rows.
 The present examples establish local accrual behavior and enumerate what is
 missing. They do not support a claim that Grove is already fully covered by
 Ethereum-only reads, or that the remaining difference is all cross-chain PnL.
+
+## Cash attribution integration
+
+`Cash` is an authorized wrapper around `Tally.sort(wad, MTM)`, with one credit
+per chain/Tally/transaction/log reference **within that Cash deployment**.
+Deploy one authoritative Cash per Tally, grant it a Tally ward, and restrict
+its writer wards to the receipt-classification process. A replacement deployment
+needs migration/reconciliation of consumed references; separate wrappers and
+direct `sort` calls do not share the deduplication ledger.
+
+The writer verifies receipt success/finality, token, receiver, payer, amount,
+USDS conversion policy, economic purpose and previous recognition. `Cash` does
+not verify an Ethereum log proof. Approved supply-income receipts are credited;
+principal returns and internal transfers are left as capital, and previously
+recognized yield must not be recognized again when paid in cash. The August
+example uses USDC/AUSD at par and the Python E21/E38/E42 payer classifications.
+That policy is explicit rather than a permanent rule that all payer transfers
+are revenue. Attribute before automatic gap routing, or explicitly exclude
+receipts already recognized by a previous route/mark/credit; reference
+deduplication alone cannot detect recognition through another accounting path.
+
+Mark the existing cash/position balances and call `Cash.note(txid, logidx, wad)`.
+The note increases supply gain and subtracts the same amount from unassigned
+equity. NAV, debt, float and demand-side accrual do not change. It remains valid
+after cash is reinvested: the position movement is capital and must not be
+credited again. Supply income first offsets any accumulated supply loss at
+settlement; it does not bypass this through `gift`.
+
+Cash currently supports positive attribution only. A mistaken classification
+requires an authorized signed `Tally.sort` correction and an audit record;
+the original receipt remains consumed. A correction after settlement affects
+a subsequent cycle rather than reversing an executed payment. The authorized
+operator remains responsible for matching credits, corrections and supporting
+evidence. Neither Cash nor the fixture is a generic proof of off-chain income.

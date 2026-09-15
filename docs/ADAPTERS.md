@@ -152,3 +152,9 @@ do not establish protocol-specific correctness or coverage by themselves.
 Individual adapters can be imported from `src/pips/<Name>.sol`. Existing named
 imports from `src/Pips.sol` remain supported. No delegatecall or proxy layer is
 introduced by splitting the source files.
+
+For separate Ethereum cash distributions, use the existing equity path rather
+than adding a duplicate NAV position. [Cash](../src/Cash.sol) wraps `sort` with
+transaction/log-reference deduplication; see the [Grove integration](GROVE-CROSS-CHAIN.md#cash-attribution-integration)
+for its trust, scope and correction requirements. This preserves supply-loss
+carry and keeps cash attribution separate from demand-side `gift` credits.

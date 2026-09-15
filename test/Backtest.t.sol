@@ -3,6 +3,7 @@ pragma solidity ^0.8.21;
 
 import { Test, console2 } from "forge-std/Test.sol";
 import { Tally } from "../src/Tally.sol";
+import { Cash } from "../src/Cash.sol";
 import { Till } from "../src/Till.sol";
 import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip, CurveLegPip, UniV3Pip, CapitalPip } from "../src/Pips.sol";
 
@@ -109,6 +110,7 @@ abstract contract ForkBase is Test {
             for (uint256 i = 0; i < ts.length; i++) ts[i].drip();
             _beforePoke(d);
             for (uint256 i = 0; i < ts.length; i++) ts[i].poke();
+            _afterPoke(d);
             _snapshot(ts, d);
         }
         uint256 eom;
@@ -117,6 +119,7 @@ abstract contract ForkBase is Test {
     }
 
     function _beforePoke(uint256) internal virtual {}
+    function _afterPoke(uint256) internal virtual {}
 
     // Machine-readable aggregate books. Grove has two ilks but only one
     // demand-side payer; owe is already gated by each Tally's pay setting.
@@ -322,6 +325,8 @@ contract GroveForkTest is ForkBase {
     ChroniclePip stacPip;
     CapitalPip buidlPip;
     int256 buidlYield;
+    Cash cash;
+    int256 cashIncome;
 
     uint256 constant PIPE_SKY   = 8339810.888358439873673301e18;
     uint256 constant PIPE_PRIME = 4913183.004893321502279642e18;
@@ -346,6 +351,9 @@ contract GroveForkTest is ForkBase {
         _fork(0);
         bloom = _new(BLOOM, ALM, SUB, 1);
         grove = _new(GROVE, DIAMOND, SUB, 0);
+        cash = new Cash(address(bloom));
+        bloom.rely(address(cash));
+        vm.makePersistent(address(cash));
         // Subsidy as the pipeline priced it for August: SOFR 3.66% ramping
         // toward BR over 24 months, T = 7 -> 3.6613% on the first $1B.
         bloom.file("cut", 0.036613e27);
@@ -408,6 +416,37 @@ contract GroveForkTest is ForkBase {
         buidlYield += bloom.sde() - before;
     }
 
+    // Verified Ethereum receipts from the configured E21/E38/E42 payers.
+    // Raw cash/reinvested positions are already in NAV; sort attributes their
+    // equity arrival to prime supply income without adding a duplicate asset.
+    function _afterPoke(uint256 day) internal override {
+        if (day == 10) {
+            _cash(0x3e2e256b5f1a165f3764dfd1905749156dc7601000fe44f4904f648066a49989, 703, 222_936.27e18);
+            _cash(0x2d5b514fb59d52479712a54d7f2bfd999f9ce92fe7fc54310a5e7d9eb96dcf1c, 467, 20e18);
+            _cash(0x67b4556fab01bdb15ed20534a693f8e6cd7264094436c60fa368e1206a184f17, 1239, 474_468.89e18);
+        }
+        if (day == 26) {
+            _cash(0xbe8c60e79230555cb3b959c5934b00eaf90d479729d5017054cc7d43bb4d0065, 272, 857_964e18);
+        }
+    }
+
+    function _cash(bytes32 txid, uint256 logidx, uint256 wad) internal {
+        uint256 nav = bloom.nav();
+        int256 gain = bloom.gain();
+        int256 gap = bloom.gap();
+        uint256 owe = bloom.owe();
+        cash.note(txid, logidx, wad);
+        assertEq(bloom.nav(), nav, "cash attribution must not add an asset");
+        assertEq(bloom.gain(), gain + int256(wad));
+        assertEq(bloom.gap(), gap - int256(wad));
+        assertEq(bloom.owe(), owe, "supply income must not use gift");
+        cashIncome += int256(wad);
+        console2.log("CASH_RECEIPT");
+        console2.logBytes32(txid);
+        console2.log("cash_log_index", logidx);
+        console2.log("cash_amount", wad);
+    }
+
     // Pipeline per-venue revenue for the venues marked above (settlements/grove/2026-08).
     uint256 constant PIPE_MARKED   = 7322.92e18 + 36533.48e18 + 570646.76e18 + 469275.10e18;   // Steakhouse USDC, Steakhouse AUSD, JAAA, STAC
     int256  constant PIPE_LP       = 165.29e18 - 49708.11e18;                                    // Curve E11, Uniswap V3 E12
@@ -425,8 +464,10 @@ contract GroveForkTest is ForkBase {
         // alone are -49,861 vs -49,543: the pipeline figure predates its
         // fee-collection credit (the Aug 17 collect of ~61.6k reads as a
         // loss to both until declared with UniV3Pip.deal).
-        assertApproxEqAbs(gain, int256(PIPE_MARKED) + PIPE_LP, 500e18);
-        console2.log("LP venues: Tally %s vs pipeline -49,542.82 (cents, signed below)", uint256(-(gain - int256(PIPE_MARKED))) / 1e16);
+        assertApproxEqAbs(gain - cashIncome, int256(PIPE_MARKED) + PIPE_LP, 500e18);
+        assertEq(cashIncome, 1_555_389.16e18);
+        console2.log("CASH_INCOME", cashIncome);
+        console2.log("LP venues: Tally %s vs pipeline -49,542.82 (cents, signed below)", uint256(-(gain - cashIncome - int256(PIPE_MARKED))) / 1e16);
         // Net Base Rate: full debt at cut/BR less the SDE slice's rebate ==
         // the pipeline's utilized (debt - sde_av) at the same tiers. The 0.6%
         // residual is the sampling rule on the day BUIDL was redeemed (75M)

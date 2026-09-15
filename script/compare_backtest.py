@@ -29,8 +29,8 @@ COVERAGE = {
     'E10': ('Ethereum SDE marks', 'CapitalPip with verified August capital-outflow declarations'),
     **{key: ('Remote position', 'Relay finalized remote shares/queues; preserve index versus capital')
        for key in ('E19', 'E20', 'E22', 'E23', 'E27')},
-    'E21': ('Remote position + Ethereum cash', 'Avalanche principal; classify Ethereum cash distributions'),
-    **{key: ('Ethereum cash attribution', 'Receipt visible locally; principal/revenue attribution required') for key in ('E38', 'E42')},
+    'E21': ('Ethereum cash credited', 'Verified receipts attributed with Cash; Avalanche principal still absent'),
+    **{key: ('Ethereum cash credited', 'Verified August receipts attributed via Cash.sort; future classification requires review') for key in ('E38', 'E42')},
     **{key: ('Display only', 'Excluded by Python accounting scope; not evidence of zero economic risk')
        for key in ('E14', 'E25', 'E33', 'E34', 'E35', 'E36')},
 }
@@ -186,8 +186,34 @@ def main():
             group = COVERAGE[venue['venue_id']][0]
             groups[group] = groups.get(group, D(0)) + D(venue['revenue'])
         partition = '\n'.join(f'| {key} | {money(value)} |' for key, value in groups.items())
-        local = groups['Ethereum marks']
+        local = groups['Ethereum marks'] + groups['Ethereum cash credited']
         assert abs(t['gain'] - local) < D('500'), 'Local matched-scope revenue regression'
+        cash_raw = (ROOT / 'test/fixtures/grove-cash-2026-08.json').read_bytes()
+        cash_fixture = json.loads(cash_raw)
+        cash_events = cash_fixture['events']
+        assert cash_fixture['chain_id'] == 1
+        assert cash_fixture['start_block'] == first['block'] and cash_fixture['end_block'] == last['block']
+        assert len(cash_events) == len({(e['tx_hash'], e['log_index']) for e in cash_events}) == 4
+        actual_receipts = re.findall(
+            r'CASH_RECEIPT\s*\n\s*(0x[0-9a-f]{64})\s*\n\s*cash_log_index (\d+)[^\n]*\n\s*cash_amount (\d+)', log)
+        assert [(tx, int(idx), int(wad)) for tx, idx, wad in actual_receipts] == [
+            (e['tx_hash'], e['log_index'], e['amount_raw'] * 10**12) for e in cash_events]
+        cash_total = sum(D(e['amount_raw']) / 10**e['decimals'] for e in cash_events)
+        reported_cash = re.findall(r'^\s*CASH_INCOME (\d+)', log, re.M)
+        assert len(reported_cash) == 1 and D(reported_cash[0]) / WAD == cash_total
+        for venue_id in ('E21', 'E38', 'E42'):
+            credited = sum(D(e['amount_raw']) / 10**e['decimals'] for e in cash_events if e['venue'] == venue_id)
+            assert credited == D(next(v['revenue'] for v in venues if v['venue_id'] == venue_id))
+        assert cash_total == groups['Ethereum cash credited']
+        cash_rows = []
+        for e in cash_events:
+            day = next(day for day in range(1,32) if snaps[day-1]['block'] < e['block'] <= snaps[day]['block'])
+            assert day == int(e['timestamp'][8:10])
+            cash_rows.append({'date': e['timestamp'][:10], 'venue': e['venue'], 'block': e['block'],
+                             'tx_hash': e['tx_hash'], 'log_index': e['log_index'],
+                             'token': e['token'], 'amount_usds_at_par': str(D(e['amount_raw']) / 10**e['decimals'])})
+        write_csv(out / 'grove-2026-08-cash.csv', cash_rows)
+        cash_table = '\n'.join(f"| {row['date']} | {row['venue']} | {money(row['amount_usds_at_par'])} | [transaction](https://etherscan.io/tx/{row['tx_hash']}) |" for row in cash_rows)
         fixture_raw = (ROOT / 'test/fixtures/buidl-2026-08.json').read_bytes()
         fixture = json.loads(fixture_raw)
         events = fixture['events']
@@ -228,6 +254,47 @@ calibrated to the provenance's pre-correction LP figure. Agreement with that
 snapshot does not validate the newer summary's LP accounting.
 BUIDL now uses CapitalPip and routes its dividend yield to SDE. JTRSY uses
 claimable redemption value, which can differ from the pipeline's share-NAV convention.
+
+### Ethereum cash attribution
+
+The replay now credits {money(cash_total)} USDS-equivalent of verified E21,
+E38 and E42 receipts, including AUSD valued at par:
+
+| Date | Venue | Income (USDS at par) | Evidence |
+|---|---|---:|---|
+{cash_table}
+
+[Cash.sol](../src/Cash.sol) uses the existing authorized `sort(wad, MTM)` path.
+Each reference includes chain ID, Tally, transaction hash and log index; the
+same reference cannot be credited twice through this Cash deployment. Income
+increases `gain` and decreases the unassigned `gap` by the same amount. It does
+not create a position, mint cash, change NAV, or credit demand-side `owe`.
+Supply-loss carry therefore applies normally. Receipt or reinvested asset
+balances remain represented by their existing pips.
+
+The writer supplies independently checked receipt evidence and classifies its
+economic purpose. Cash does not verify logs on-chain. These four August
+receipts follow the Python payer/venue attribution; returned principal,
+transfers between own accounts and previously recognized yield must not be
+submitted as new income. A known payer is not blanket authorization for all
+future receipts. Use one authoritative Cash deployment per Tally; deduplication
+does not extend across separate deployments or direct calls to `sort`.
+
+Credits are applied after the corresponding day's marks in this accrual replay.
+Tests check each credit leaves NAV and agent accrual unchanged, moves exactly
+its amount from gap to gain, and matches the fixture transaction/log references.
+Unit tests also cover reinvestment, duplicate rejection and supply-loss carry.
+The collector verifies the successful receipts, tokens, payers, receiver,
+amounts and log indices. Fixture SHA-256: `{digest(cash_raw)}`.
+See [receipt data](grove-2026-08-cash.csv) and
+[the fixture](../test/fixtures/grove-cash-2026-08.json).
+Recollect with `ETH_RPC=<alchemy-compatible-rpc> python3 script/collect_grove_cash.py`.
+
+The remaining prime-investment shortfall is
+{money(r['prime_agent_revenue'] - t['gain'])} USDS:
+{money(groups['Remote position'])} from remote-position revenue, plus
+{money(local - t['gain'])} on the Ethereum positions already marked. E21's
+cash income is now covered; its Avalanche principal is still not in local NAV.
 
 ### BUIDL update
 
@@ -297,7 +364,7 @@ it does not claim a single rate-conversion explanation for all residuals.
         'or Till payments, no remote-chain replay, and no imported cash classifications.'
         if prime == 'osero' else
         'or Till payments and no remote-chain replay. Grove imports BUIDL capital\n'
-        'classifications from its verified transfer fixture; other cash income remains unclassified.'
+        'classifications and E21/E38/E42 cash income from verified transfer fixtures.'
     )
     text = f'''# {prime.title()} — August 2026 historical accrual example
 
