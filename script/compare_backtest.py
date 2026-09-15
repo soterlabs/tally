@@ -26,7 +26,7 @@ DIRECT = {'E1', 'E2', 'E3', 'E4', 'E5', 'E6', 'E7', 'E8', 'E11', 'E12', 'E13',
 COVERAGE = {
     **{key: ('Ethereum marks', 'Local adapter; LP collect and capital-flow hooks still required') for key in DIRECT},
     'E9': ('Ethereum SDE marks', 'ERC-7540 claim valuation differs from headline NAV'),
-    'E10': ('Ethereum balance only', 'RawPip misses minted dividends; declare capital with CapitalPip'),
+    'E10': ('Ethereum SDE marks', 'CapitalPip with verified August capital-outflow declarations'),
     **{key: ('Remote position', 'Relay finalized remote shares/queues; preserve index versus capital')
        for key in ('E19', 'E20', 'E22', 'E23', 'E27')},
     'E21': ('Remote position + Ethereum cash', 'Avalanche principal; classify Ethereum cash distributions'),
@@ -188,6 +188,28 @@ def main():
         partition = '\n'.join(f'| {key} | {money(value)} |' for key, value in groups.items())
         local = groups['Ethereum marks']
         assert abs(t['gain'] - local) < D('500'), 'Local matched-scope revenue regression'
+        fixture_raw = (ROOT / 'test/fixtures/buidl-2026-08.json').read_bytes()
+        fixture = json.loads(fixture_raw)
+        events = fixture['events']
+        assert fixture['start_block'] == first['block'] and fixture['end_block'] == last['block']
+        assert fixture['decimals'] == 6
+        minted = sum(e['amount_raw'] for e in events if e['kind'] == 'dividend_mint')
+        outgoing = [e for e in events if e['kind'] == 'capital_outflow']
+        assert fixture['closing_balance_raw'] - fixture['opening_balance_raw'] == minted - sum(e['amount_raw'] for e in outgoing)
+        # Guard the EoD staging assumptions baked into GroveForkTest. No
+        # dividend may follow a capital outflow within either affected day.
+        for day, expected in ((24, 50_000_000), (31, 25_000_000)):
+            day_events = [e for e in events if snaps[day-1]['block'] < e['block'] <= snaps[day]['block']]
+            flows = [e for e in day_events if e['kind'] == 'capital_outflow']
+            assert len(flows) == 2 and sum(e['amount_raw'] for e in flows) == expected * 10**6
+            assert max(e['block'] for e in day_events if e['kind'] == 'dividend_mint') < min(e['block'] for e in flows)
+        assert len(outgoing) == 4
+        observed_yield = re.findall(r'^\s*BUIDL_YIELD (-?\d+)(?:\s+.*)?$', log, re.M)
+        assert len(observed_yield) == 1, 'Requires updated CapitalPip replay'
+        buidl_yield = D(observed_yield[0]) / WAD
+        assert abs(buidl_yield - D(minted) / 10**6) < D('.01')
+        buidl_pipeline = D(next(v['sd_revenue'] for v in venues if v['venue_id'] == 'E10'))
+        buidl_flows = '\n'.join(f"| {e['block']} | {money(D(e['amount_raw']) / 10**6)} | [transaction](https://etherscan.io/tx/{e['tx_hash']}) |" for e in outgoing)
         scope = f'''
 ## Grove coverage
 
@@ -204,10 +226,48 @@ The matched Ethereum subset is {money(local)} USDS versus Tally's
 fees are not declared in this baseline; its historical pricing assertion was
 calibrated to the provenance's pre-correction LP figure. Agreement with that
 snapshot does not validate the newer summary's LP accounting.
-BUIDL balances and utilization rebates are included, but its
-{money(r['sde_revenue'] - D(next(v['sd_revenue'] for v in venues if v['venue_id'] == 'E9')))}
-USDS minted dividends are absent from index PnL. JTRSY uses claimable redemption
-value, which can differ from the pipeline's share-NAV convention.
+BUIDL now uses CapitalPip and routes its dividend yield to SDE. JTRSY uses
+claimable redemption value, which can differ from the pipeline's share-NAV convention.
+
+### BUIDL update
+
+| Metric | CapitalPip replay | Python provenance | Difference |
+|---|---:|---:|---:|
+| BUIDL dividend yield | {money(buidl_yield)} | {money(buidl_pipeline)} | {money(buidl_yield - buidl_pipeline)} |
+
+The [verified transfer fixture](../test/fixtures/buidl-2026-08.json) contains
+21 issuer mints and four outgoing transfers. Actual capital outflows total
+75,000,000 USDS; the pipeline includes only 74,998,999 USDS because its
+1M-USDS transfer threshold excludes the 1 and 1,000 USDS outgoing legs.
+These small transfers go to the same recipient as their larger paired legs;
+we classify all four as capital. This increases measured dividend revenue
+by 1,001 USDS versus the provenance, rather than forcing agreement with its filter.
+No capital subscriptions occur in this August fixture. Issuer-mint income
+classification follows the baseline's policy for this observed set; a transfer
+log by itself does not prove economic purpose for arbitrary future mints.
+
+| Capital-outflow block | USDS | Evidence |
+|---|---:|---|
+{buidl_flows}
+
+The collector uses Alchemy-compatible transfer discovery, verifies amounts
+against block-local Transfer logs, and reconciles intermediate and boundary
+balances. Fixture SHA-256: `{digest(fixture_raw)}`.
+Recollect with `ETH_RPC=<alchemy-compatible-rpc> python3 script/collect_buidl.py`.
+
+The fixture shows that dividends precede both paired outflows on August 24
+and 31, with no intervening mints. To preserve the earlier daily borrowing-cost
+comparison, the test first accrues against actual EoD balances, then stages
+only the BUIDL pre-outflow balance with a test mock, marks yield, calls
+`deal(-outflow)`, restores the real balance and marks the new capital shares.
+This emulates capital attribution at the daily boundary; it is not execution
+of historical transactions or proof of production hook permissions. A live
+integration must mark and declare capital at the actual transfer time.
+
+Before this update, BUIDL contributed zero index PnL. Total measured SDE yield
+therefore increases by {money(buidl_yield)} USDS. Prime revenue is unchanged:
+BUIDL's yield belongs entirely to Sky. The remaining SDE difference also
+includes the roughly 279 USDS JTRSY claim-valuation difference.
 
 The replay fixes the subsidy to 3.6613% on the first billion USDS of BLOOM debt.
 The Python daily subsidy varies; its period-average subsidized rate is
@@ -233,6 +293,12 @@ The pipeline uses monthly SSR conversion; Tally uses the on-chain sUSDS index.
 The table isolates investment revenue, net borrowing cost and agent accrual;
 it does not claim a single rate-conversion explanation for all residuals.
 '''
+    execution_scope = (
+        'or Till payments, no remote-chain replay, and no imported cash classifications.'
+        if prime == 'osero' else
+        'or Till payments and no remote-chain replay. Grove imports BUIDL capital\n'
+        'classifications from its verified transfer fixture; other cash income remains unclassified.'
+    )
     text = f'''# {prime.title()} — August 2026 historical accrual example
 
 Deploy on a local Ethereum fork at block {first['block']} (July 31); preserve
@@ -241,7 +307,7 @@ Tally and its adapters through 31 end-of-day forks to block {last['block']}
 adapters' documented stablecoin-par convention; differences are Tally minus Python.
 
 This is **historical accrual**, not a daily-payment counterfactual: no `settle`
-or Till payments, no remote-chain replay, and no imported cash classifications.
+{execution_scope}
 Historical debt changes remain in the observations. Default gap routing is NIL.
 
 | Metric | Tally | Python provenance | Difference |

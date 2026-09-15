@@ -9,7 +9,7 @@ E37,ethereum,Maple syrupUSDC (ERC-4626),Ethereum marks,Local adapter; LP collect
 E7,ethereum,Securitize Tokenized AAA CLO Fund (STAC),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,469275.100000,0.000000,102600718.700000,103069993.800000
 E8,ethereum,Janus Henderson Anemoy AAA CLO (JAAA),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,570646.7643450183186791680,0E-19,130164330.4336037730353834150,130734977.1979487913540625830
 E9,ethereum,Janus Henderson Anemoy Treasury Fund (JTRSY),Ethereum SDE marks,ERC-7540 claim valuation differs from headline NAV,0E-19,2507613.2940321578373975063,855559413.9886077906789031253,858067027.2826399485163006316
-E10,ethereum,BlackRock USD Institutional Digital Liquidity Fund (BUIDL-I),Ethereum balance only,RawPip misses minted dividends; declare capital with CapitalPip,0.0000,2111592.7500,716141828.0200,643254421.7700
+E10,ethereum,BlackRock USD Institutional Digital Liquidity Fund (BUIDL-I),Ethereum SDE marks,CapitalPip with verified August capital-outflow declarations,0.0000,2111592.7500,716141828.0200,643254421.7700
 E11,ethereum,Curve AUSD/USDC stableswap LP,Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,165.29099734814771815091,0E-20,25001934.08299074383943870839,0
 E12,ethereum,Uniswap V3 AUSD/USDC pool (NFT positions),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,-49708.105287,-0.000000,25057232.614785,29007524.509497
 E30,ethereum,Uniswap V3 AUSD/USDC pool (NFT positions — alt holder),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0

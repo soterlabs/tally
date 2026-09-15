@@ -70,3 +70,9 @@ without RPC calls (the sibling pipeline checkout is still required).
 `forge test --match-contract CrossChainExampleTest -vv` runs a synthetic
 cash → transit claim → remote position → cash example using RelayPip,
 including yield, loss and stale-data behavior.
+
+Grove's BUIDL position uses CapitalPip, seeded with opening capital and August
+outflows reconstructed in [the transfer fixture](test/fixtures/buidl-2026-08.json).
+The updated report explains its dividend attribution and the Python pipeline's
+1,001 USDS transfer-threshold difference. To reverify the fixture against logs
+and historical balances, use `ETH_RPC=<alchemy-compatible rpc> python3 script/collect_buidl.py`.

@@ -4,7 +4,9 @@ pragma solidity ^0.8.21;
 import { Test, console2 } from "forge-std/Test.sol";
 import { Tally } from "../src/Tally.sol";
 import { Till } from "../src/Till.sol";
-import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip, CurveLegPip, UniV3Pip } from "../src/Pips.sol";
+import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip, CurveLegPip, UniV3Pip, CapitalPip } from "../src/Pips.sol";
+
+interface BalanceLike { function balanceOf(address) external view returns (uint256); }
 
 interface KissLike { function kiss(address) external; }
 
@@ -104,13 +106,17 @@ abstract contract ForkBase is Test {
         _snapshot(ts, 0);
         for (uint256 d = 1; d < 32; d++) {
             _fork(d);
-            for (uint256 i = 0; i < ts.length; i++) { ts[i].drip(); ts[i].poke(); }
+            for (uint256 i = 0; i < ts.length; i++) ts[i].drip();
+            _beforePoke(d);
+            for (uint256 i = 0; i < ts.length; i++) ts[i].poke();
             _snapshot(ts, d);
         }
         uint256 eom;
         for (uint256 i = 0; i < ts.length; i++) eom += ts[i].nav();
         console2.log("%s  EoM nav %s  debt %s", name, eom / 1e18, _debt(ts) / 1e18);
     }
+
+    function _beforePoke(uint256) internal virtual {}
 
     // Machine-readable aggregate books. Grove has two ilks but only one
     // demand-side payer; owe is already gated by each Tally's pay setting.
@@ -314,6 +320,8 @@ contract GroveForkTest is ForkBase {
     address constant STAC_ORACLE = 0x802CaCc19B9b3eb474C7DEf6f28c64AB67fb0753;   // Chronicle
     address constant CHRONICLE_AUTHED = 0x62a69d7832040Cd629Ee2f712b4C8639C0F905D7;
     ChroniclePip stacPip;
+    CapitalPip buidlPip;
+    int256 buidlYield;
 
     uint256 constant PIPE_SKY   = 8339810.888358439873673301e18;
     uint256 constant PIPE_PRIME = 4913183.004893321502279642e18;
@@ -358,7 +366,11 @@ contract GroveForkTest is ForkBase {
         bloom.init(STAC, address(stacPip), bloom.MTM());
         _v7540(bloom, JAAA,  JAAA_VAULT,  bloom.MTM());
         _v7540(bloom, JTRSY, JTRSY_VAULT, bloom.SDE());
-        _raw(bloom, BUIDL, bloom.SDE());          // const $1; its yield arrives as mints (flows)
+        buidlPip = new CapitalPip(BUIDL);
+        vm.makePersistent(address(buidlPip));
+        // Seed existing opening capital at par before Tally's first mark.
+        buidlPip.deal(ALM, int256(BalanceLike(BUIDL).balanceOf(ALM) * 1e12));
+        bloom.init(BUIDL, address(buidlPip), bloom.SDE());
         _raw(bloom, RLUSD, bloom.MTM());
         _raw(bloom, AUSD,  bloom.MTM());
         _raw(bloom, USDC,  bloom.MTM());
@@ -375,6 +387,25 @@ contract GroveForkTest is ForkBase {
         _raw(bloom, address(uint160(USDC) + 1), USDC, bloom.MTM(), ALT);
         _raw(bloom, address(uint160(USDS) + 1), USDS, bloom.MTM(), DIAMOND);
         _raw(bloom, address(uint160(USDS) + 2), USDS, bloom.MTM(), ESCROW);
+    }
+
+    // Replay the declared-capital hook after daily drip, preserving the
+    // original EoD debt/rebate sampling. Verified transfer fixture shows all
+    // dividend mints precede the two paired redemptions on these days, with
+    // no mints between their legs. Stage only BUIDL's pre-redemption balance
+    // at EoD; this is attribution replay, not actual intraday execution.
+    function _beforePoke(uint256 day) internal override {
+        uint256 outflow = day == 24 ? 50_000_000e6 : day == 31 ? 25_000_000e6 : 0;
+        int256 before = bloom.sde();
+        if (outflow > 0) {
+            uint256 closing = BalanceLike(BUIDL).balanceOf(ALM);
+            vm.mockCall(BUIDL, abi.encodeCall(BalanceLike.balanceOf, (ALM)), abi.encode(closing + outflow));
+            bloom.poke(BUIDL); // recognize dividend yield before capital leaves
+            buidlPip.deal(ALM, -int256(outflow * 1e12));
+            vm.clearMockedCalls(); // return to the actual historical EoD balance
+        }
+        bloom.poke(BUIDL); // seed post-capital shares; no second yield booking
+        buidlYield += bloom.sde() - before;
     }
 
     // Pipeline per-venue revenue for the venues marked above (settlements/grove/2026-08).
@@ -406,9 +437,12 @@ contract GroveForkTest is ForkBase {
         assertGe(tab - rebate, PIPE_COF);
         // JTRSY: the pipeline values escrowed shares at NAV, Tally values the
         // fulfilled part at its fixed claim (maxWithdraw): ~280 USDS apart.
-        assertApproxEqAbs(uint256(sde), PIPE_E9, 400e18);
-        // BUIDL's 2.11M is absent by construction: its yield arrives as
-        // mints, which are flows to an index-based reader.
+        assertApproxEqAbs(buidlYield, 2_112_593.75e18, 0.01e18);
+        assertApproxEqAbs(sde - buidlYield, int256(PIPE_E9), 400e18);
+        console2.log("BUIDL_YIELD", buidlYield);
+        // The pipeline drops the 1 + 1,000 USDS test legs from capital via
+        // its threshold, reducing reported revenue by 1,001 USDS. We declare
+        // all four legs (75M total) and recognize the actual dividend mints.
         // Sky share: full debt (2.79B) at cut/BR, vs the pipeline's utilized
         // (debt - 1.57B of SDE assets) at the same rates. Tally is higher.
         assertGt(tab, PIPE_SKY);

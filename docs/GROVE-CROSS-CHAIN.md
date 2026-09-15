@@ -17,7 +17,7 @@ classifies every revenue venue and display-only holding in that snapshot.
 | Grove allocations | Available evidence | Remaining work |
 |---|---|---|
 | Ethereum Aave, Morpho, Maple, STAC, JAAA, JTRSY, Curve, Uniswap, raw balances | Local balances, vault indices, oracle prices and claims | Existing pips cover the basic reads. Integrate movement/fee hooks, oracle permissions/freshness and claim valuation. |
-| E10 BUIDL | Local token balance, including dividend mints | RawPip reads balance but cannot distinguish dividends from subscriptions. CapitalPip can model declared capital and residual yield if every capital movement is bracketed. Historical event reconstruction is still needed. |
+| E10 BUIDL | Local token balance, including dividend mints | The updated replay uses CapitalPip with opening capital and verified August outflow declarations. Live subscriptions/redemptions still need atomic hooks; mint classification remains an explicit policy. |
 | E19/E23 Base Morpho; E27 Base idle | Remote shares, balances and vault index | Relay authenticated remote state. An Ethereum bridge escrow balance does not establish Grove's current vault shares or yield. |
 | E20 Avalanche JAAA | Ethereum NAV feed; Avalanche holder balance | Keep the NAV local if appropriate; relay ownership and pending claims. A local price alone is insufficient. |
 | E22 Plume ACRDX | Ethereum price feed; remote shares and redemptions | Relay the remote position and distinguish actual redemption proceeds from indicative NAV. The pipeline config explicitly uses a separate redemption-pricing convention. |
@@ -109,8 +109,10 @@ since that bypasses supply loss carry and changes payment semantics.
 
 ## What full coverage would require next
 
-A full historical Grove example should reconstruct Ethereum BUIDL capital and
-LP fee events, classify E21/E38/E42 receipts, then replay Base, Avalanche and
+BUIDL capital attribution is now reconstructed from 25 verified August
+transfers; see the report for the 1,001 USDS threshold difference with Python.
+To complete historical Grove coverage, reconstruct LP fee events, classify
+E21/E38/E42 receipts, then replay Base, Avalanche and
 Plume from their pinned blocks with matched transfer references. Add remote
 queues, loss/recovery cases and cross-ilk reconciliation before simulating
 Till payments. Reconcile the source report versions first: the current summary
