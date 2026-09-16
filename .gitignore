@@ -5,3 +5,6 @@ broadcast/
 .env.*
 __pycache__/
 *.py[cod]
+
+# Narrative reports are generated on demand; replay data stays tracked.
+/reports/*.md

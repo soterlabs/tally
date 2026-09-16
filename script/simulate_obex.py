@@ -192,7 +192,8 @@ The monthly-hook scenario changes net PnL by
 legacy debt at the modeled day-17 boundary. The unrelated extra-refresh
 scenario is exactly equal to Current.
 
-These figures differ from the [accrual-only replay](obex-2026-08.md), because
+These figures differ from the accrual-only replay in
+[ObexForkTest](../test/Backtest.t.sol), because
 daily draws and payments now remain in the next day's balances. No hypothetical
 new investments or discretionary withdrawals are modeled. All funded scenarios
 pay every whole-USDS claim and need no starting float for this profitable month;

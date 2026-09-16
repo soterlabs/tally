@@ -366,7 +366,7 @@ endpoint sampling on debt/SDE changes, and block timing. It is not solely an
 SSR difference. No SOFR values are imported into Tally during this run.
 
 See [all venue coverage](grove-2026-08-coverage.csv) and the
-[Ethereum/cross-chain design](../docs/GROVE-CROSS-CHAIN.md).
+[adapter boundaries](../ARCHITECTURE.md#recovery-and-adapter-boundaries).
 Coverage config SHA-256: `{digest(config_raw)}`.
 '''
     else:

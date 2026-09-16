@@ -77,12 +77,24 @@ payments, surplus joins and revocation using impersonated authorities.
 | Ethereum can consolidate a multi-chain book | Local price feeds do not prove remote ownership. Source finality, timestamps, replay protection, transfer matching and in-transit claims require additional infrastructure. |
 | Explicit references improve cash-attribution auditability | Cash trusts its writer's classification. Its deduplication is per deployment, not global proof against recognition through another accounting path. |
 
-Gas, contract-size limits, governance permissions and operational availability
-also constrain deployment. Stale inputs or failed calls can prevent settlement;
-operators need monitoring and rehearsed recovery procedures. Quarantined NAV
-contains last-known values and must not be presented as a fresh valuation. Stablecoin-par valuation,
-RWA redemption claims, LP fees and off-chain facility valuations require
-explicit agreement rather than implicit adapter assumptions.
+## Remaining concerns before payments
+
+- **Remote evidence:** RelayPip checks receipt age only. Source age, finality,
+  domain/sequence protection, ownership and bridge reconciliation remain open.
+- **Attribution:** one ledger must prevent income recognition through multiple
+  Cash deployments, direct sort, index marks or automatic gap routing.
+- **Timing and payment netting:** permissionless settlement has no daily limit;
+  drip frequency partitions interest intervals. Agree timing economics and net
+  daily payments against monthly obligations before enabling either together.
+- **Venue integration:** Grove's LP replay lacks transaction-level collection
+  hooks; BUIDL outflows are staged at EoD. Production hooks and valuation policies
+  still need validation. Par pricing does not model stablecoin depegs.
+- **Availability and recovery:** unsolicited NFTs can exceed the LP reader's
+  32-NFT limit. Quarantine blocks settlement and leaves NAV at last-known values;
+  operators must review replacement marks, missing rebates and unresolved equity.
+- **Independent review:** passing tests do not replace an audit. Advisory lint
+  warnings, numeric bounds, external-call ordering and portfolio gas budgets
+  remain review work. Require the CI gate and configure archive-workflow access.
 
 ## Questions for Sky ecosystem teams
 
@@ -123,6 +135,6 @@ The repository now packages frozen MSC inputs, offline report validation, CI
 workflows and lifecycle regressions. These make the proposal reviewable; they do
 not replace an independent audit or an approved deployment and operating plan.
 
-Further detail: [adapter requirements](ADAPTERS.md),
-[Grove coverage and cross-chain design](GROVE-CROSS-CHAIN.md), and
-[August Grove comparison](../reports/grove-2026-08.md).
+Code reference: [architecture](../../ARCHITECTURE.md). The repository retains
+[replay data](../../reports/) and [frozen MSC inputs](../../test/fixtures/msc/);
+detailed comparison reports can be regenerated from the saved logs.
