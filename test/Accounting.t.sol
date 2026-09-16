@@ -220,6 +220,69 @@ contract AccountingTest is Test {
         tally.poke(address(pip));
     }
 
+    // The rebate interval follows drip, even when no caller marks the position.
+    function test_rebate_drips_refresh_idle_endpoints() public { _rebateDrips(tally.IDL()); }
+    function test_rebate_drips_refresh_sde_endpoints() public { _rebateDrips(tally.SDE()); }
+    function test_rebate_drips_refresh_sav_endpoints() public { _rebateDrips(tally.SAV()); }
+
+    function _rebateDrips(uint8 tag) internal {
+        vat.frob(ILK, 100_000_000e18); tally.drip();
+        RelayPip pip = new RelayPip();
+        pip.poke(ALM, 100_000_000e18, RAY, 0);
+        tally.init(address(pip), address(pip), tag);
+        vm.warp(block.timestamp + 1 days);
+        pip.poke(ALM, 50_000_000e18, RAY, 0);
+        tally.drip();
+        uint256 before = tally.rebate();
+        uint256 snap = vm.snapshotState();
+        tally.poke(address(pip));
+        vm.warp(block.timestamp + 1 days);
+        pip.poke(ALM, 100_000_000e18, RAY, 0);
+        tally.drip();
+        uint256 marked = tally.rebate() - before;
+        vm.revertToState(snap);
+        uint256 tab = tally.tab();
+        vm.warp(block.timestamp + 1 days);
+        pip.poke(ALM, 100_000_000e18, RAY, 0);
+        tally.drip();
+        assertEq(tally.rebate() - before, marked);
+        uint256 expected = tag == tally.SAV()
+            ? uint256(50_000_000e18) * ((0.002e27 / uint256(365 days)) * 1 days) / RAY
+            : (tally.tab() - tab) / 2;
+        assertApproxEqAbs(marked, expected, 1);
+    }
+
+    function test_same_block_drip_refreshes_rebate_after_movement() public {
+        vat.frob(ILK, 100_000_000e18); tally.drip();
+        RelayPip pip = new RelayPip();
+        pip.poke(ALM, 50_000_000e18, RAY, 0);
+        tally.init(address(pip), address(pip), tally.IDL());
+        pip.poke(ALM, 100_000_000e18, RAY, 0);
+        tally.drip(); // post-movement endpoint, no elapsed time and no poke
+        assertEq(tally.rebate(), 0);
+        vm.warp(block.timestamp + 1 days);
+        pip.poke(ALM, 100_000_000e18, RAY, 0);
+        tally.drip();
+        assertEq(tally.rebate(), tally.tab());
+    }
+
+    function test_rebate_sampling_preserves_unmarked_index_income() public {
+        vat.frob(ILK, 1_000e18); tally.drip();
+        RelayPip pip = new RelayPip();
+        pip.poke(ALM, 100e18, RAY, 0);
+        tally.init(address(pip), address(pip), tally.SAV());
+        vm.warp(block.timestamp + 1 days);
+        pip.poke(ALM, 100e18, 1.1e27, 0);
+        tally.drip();
+        vm.warp(block.timestamp + 1 days);
+        pip.poke(ALM, 100e18, 1.2e27, 0);
+        tally.drip();
+        assertEq(tally.gain(), 0);
+        tally.poke(address(pip));
+        assertEq(tally.gain(), 20e18);
+        assertEq(tally.flux(), 0);
+    }
+
     struct Ledger {
         int256 gain;
         uint256 fee;

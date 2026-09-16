@@ -68,7 +68,10 @@ path remain the authorized writer's responsibility.
 spread divided by 365 days. It uses the higher debt endpoint and lower demand/
 rebate balance endpoints. Subsidized principal receives `cut` up to `line`;
 IDL/SDE deductions reduce utilized debt across that same charge curve. SAV rebates
-the spread. Applied rebates cannot exceed accrued charges (`tab`).
+the spread. Applied rebates cannot exceed accrued charges (`tab`). Separate
+rebate samples refresh on every drip, including same-block calls, without
+changing PnL marks. Position marks and configuration/flow hooks also refresh
+the samples for the next interval.
 
 **`poke(gem)`** books index PnL and residual flow, then stores the new mark.
 `poke()` marks all gems. Rebate-bearing positions require a fresh drip. Register

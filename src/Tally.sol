@@ -174,6 +174,7 @@ contract Tally {
     uint256 public sus;      // SubProxy sUSDS value                                [wad]
 
     mapping (address => Gem) public gems;
+    mapping (address => uint256) public rvals; // rebate endpoints, separate from PnL marks [wad]
     address[]                public list;
 
     mapping (bytes32 => uint256) public notes; // consumed external-settlement references
@@ -265,7 +266,7 @@ contract Tally {
         g.rho = block.timestamp;
         list.push(gem);
         // Seed the index so the first real poke books no phantom PnL.
-        (g.pie, g.chi, g.own) = _read(gem);
+        _seed(gem);
         emit Init(gem, pip, tag);
     }
 
@@ -300,8 +301,7 @@ contract Tally {
             }
             alm = data;
             for (uint256 k = 0; k < list.length; k++) {
-                Gem storage g = gems[list[k]];
-                (g.pie, g.chi, g.own) = _read(list[k]);
+                _seed(list[k]);
             }
         }
         else if (what == "till") {
@@ -339,7 +339,7 @@ contract Tally {
         else if (what == "cap") g.cap = data;
         else if (what == "tag") { require(data >= MTM && data <= NIL, "Tally/bad-tag"); g.tag = uint8(data); }
         else revert("Tally/file-unrecognized-param");
-        (g.pie, g.chi, g.own) = _read(gem);
+        _seed(gem);
         emit File(gem, what, data);
     }
 
@@ -352,7 +352,7 @@ contract Tally {
         if      (what == "pip") g.pip = data;
         else if (what == "who") g.who = data;
         else revert("Tally/file-unrecognized-param");
-        (g.pie, g.chi, g.own) = _read(gem);
+        _seed(gem);
         emit File(gem, what, data);
     }
 
@@ -411,7 +411,9 @@ contract Tally {
         uint256 was = _val(g.pie, g.chi, g.own);
         (g.pie, g.chi, g.own) = _read(gem);
         g.rho = block.timestamp;
-        delta = int256(_val(g.pie, g.chi, g.own)) - int256(was);
+        uint256 val = _val(g.pie, g.chi, g.own);
+        rvals[gem] = val;
+        delta = int256(val) - int256(was);
     }
 
     /// @notice Classify a just-executed external settlement's debt increase.
@@ -533,6 +535,9 @@ contract Tally {
 
             rho = block.timestamp;
             emit Drip(d, dchi, fee, ar, rb);
+        } else {
+            // Post-movement hooks refresh rebate endpoints even without elapsed time.
+            _rebates(0, 0, 0);
         }
 
         capital += int256(d) - int256(art);
@@ -552,7 +557,7 @@ contract Tally {
     // to the net principal. A single marginal rate is wrong if deductions
     // cross the subsidy cap. SAV's spread credit is separate; settle caps the
     // combined credit by accrued tab. Registration must avoid overlapping slices.
-    function _rebates(uint256 base, uint256 dt, uint256 br) internal view returns (uint256 rb) {
+    function _rebates(uint256 base, uint256 dt, uint256 br) internal returns (uint256 rb) {
         uint256 idle;
         uint256 spread = _ps(pad) * dt;
         for (uint256 k = 0; k < list.length; k++) {
@@ -560,7 +565,9 @@ contract Tally {
             if (stopped[list[k]] == 1) continue;
             if (g.tag != SAV && g.tag != IDL && g.tag != SDE) continue;
             (uint256 pie, uint256 chi_, uint256 own) = _read(list[k]);
-            uint256 v = _min(_val(pie, chi_, own), _val(g.pie, g.chi, g.own));
+            uint256 val = _val(pie, chi_, own);
+            uint256 v = _min(val, rvals[list[k]]);
+            rvals[list[k]] = val;
             if (g.tag == SAV) rb += _rmul(v, spread);
             else {
                 if (g.tag == SDE && g.cap > 0) v = _min(v, g.cap);
@@ -619,6 +626,7 @@ contract Tally {
         g.chi = chi_;
         g.own = own;
         g.rho = block.timestamp;
+        rvals[gem] = val;
         emit Poke(gem, pie, chi_, own, val, dpnl);
     }
 
