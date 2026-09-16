@@ -1,0 +1,79 @@
+venues:
+  - id: E1
+    chain: ethereum
+  - id: E2
+    chain: ethereum
+  - id: E3
+    chain: ethereum
+  - id: E4
+    chain: ethereum
+  - id: E5
+    chain: ethereum
+  - id: E6
+    chain: ethereum
+  - id: E37
+    chain: ethereum
+  - id: E7
+    chain: ethereum
+  - id: E8
+    chain: ethereum
+  - id: E9
+    chain: ethereum
+  - id: E10
+    chain: ethereum
+  - id: E11
+    chain: ethereum
+  - id: E12
+    chain: ethereum
+  - id: E30
+    chain: ethereum
+  - id: E33
+    chain: monad
+  - id: E13
+    chain: ethereum
+  - id: E14
+    chain: ethereum
+  - id: E31
+    chain: ethereum
+  - id: E15
+    chain: ethereum
+  - id: E32
+    chain: ethereum
+  - id: E16
+    chain: ethereum
+  - id: E17
+    chain: ethereum
+  - id: E18
+    chain: ethereum
+  - id: E36
+    chain: ethereum
+  - id: E19
+    chain: base
+  - id: E23
+    chain: base
+  - id: E20
+    chain: avalanche_c
+  - id: E21
+    chain: avalanche_c
+  - id: E22
+    chain: plume
+  - id: E24
+    chain: ethereum
+  - id: E26
+    chain: ethereum
+  - id: E27
+    chain: base
+  - id: E25
+    chain: monad
+  - id: E34
+    chain: monad
+  - id: E35
+    chain: monad
+  - id: E38
+    chain: ethereum
+  - id: E40
+    chain: ethereum
+  - id: E41
+    chain: ethereum
+  - id: E42
+    chain: ethereum

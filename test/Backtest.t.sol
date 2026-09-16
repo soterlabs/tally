@@ -3,8 +3,11 @@ pragma solidity ^0.8.21;
 
 import { Test, console2 } from "forge-std/Test.sol";
 import { Tally } from "../src/Tally.sol";
+import { Cash } from "../src/Cash.sol";
 import { Till } from "../src/Till.sol";
-import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip, CurveLegPip, UniV3Pip } from "../src/Pips.sol";
+import { RawPip, Erc4626Pip, Erc7540Pip, ATokenPip, ChroniclePip, LendingIdlePip, CurveLegPip, UniV3Pip, CapitalPip } from "../src/Pips.sol";
+
+interface BalanceLike { function balanceOf(address) external view returns (uint256); }
 
 interface KissLike { function kiss(address) external; }
 
@@ -43,7 +46,7 @@ abstract contract ForkBase is Test {
 
     // The backtests only drip and poke, but wire a Till anyway so a run that
     // calls settle() behaves as a deployment would (it needs the allocator
-    // roles, which a historical fork cannot grant).
+    // roles; PermissionsForkTest rehearses granting them on an isolated fork).
     function _new(bytes32 ilk, address alm, address sub, uint256 pay) internal returns (Tally t) {
         t = new Tally(ilk, VAT, USDS, SUSDS);
         Till till = new Till(address(t), VOW, USDS_JOIN, USDS);
@@ -101,13 +104,44 @@ abstract contract ForkBase is Test {
         uint256 som;
         for (uint256 i = 0; i < ts.length; i++) som += ts[i].nav();
         console2.log("%s  SoM nav %s  debt %s", name, som / 1e18, _debt(ts) / 1e18);
+        _snapshot(ts, 0);
         for (uint256 d = 1; d < 32; d++) {
             _fork(d);
-            for (uint256 i = 0; i < ts.length; i++) { ts[i].drip(); ts[i].poke(); }
+            for (uint256 i = 0; i < ts.length; i++) ts[i].drip();
+            _beforePoke(d);
+            for (uint256 i = 0; i < ts.length; i++) ts[i].poke();
+            _afterPoke(d);
+            _snapshot(ts, d);
         }
         uint256 eom;
         for (uint256 i = 0; i < ts.length; i++) eom += ts[i].nav();
         console2.log("%s  EoM nav %s  debt %s", name, eom / 1e18, _debt(ts) / 1e18);
+    }
+
+    function _beforePoke(uint256) internal virtual {}
+    function _afterPoke(uint256) internal virtual {}
+
+    // Machine-readable aggregate books. Grove has two ilks but only one
+    // demand-side payer; owe is already gated by each Tally's pay setting.
+    function _snapshot(Tally[] memory ts, uint256 day) internal view {
+        uint256 nav; uint256 tab; uint256 rebate; uint256 owe;
+        int256 gain; int256 sde; int256 gap;
+        for (uint256 i = 0; i < ts.length; i++) {
+            nav += ts[i].nav(); tab += ts[i].tab(); rebate += ts[i].rebate();
+            owe += ts[i].owe(); gain += ts[i].gain(); sde += ts[i].sde();
+            gap += ts[i].gap() + ts[i].flux() - ts[i].capital();
+        }
+        console2.log("BACKTEST_DAY", day);
+        console2.log("block", block.number);
+        console2.log("timestamp", block.timestamp);
+        console2.log("debt", _debt(ts));
+        console2.log("nav", nav);
+        console2.log("tab", tab);
+        console2.log("rebate", rebate);
+        console2.log("owe", owe);
+        console2.log("gain", gain);
+        console2.log("sde", sde);
+        console2.log("gap", gap);
     }
 
     function _debt(Tally[] memory ts) internal view returns (uint256 d) {
@@ -206,7 +240,7 @@ contract ObexForkTest is ForkBase {
 // Osero: SparkLend spUSDS (rebasing aToken) plus idle USDS, on the Diamond PAU
 // ALM Proxy. A 13M draw and deposit mid-month. The pipeline deducts the
 // prime's share of unborrowed USDS in the SparkLend pool ("lending idle")
-// from utilized; Tally charges the full ilk debt.
+// from utilized; Tally rebates that share with LendingIdlePip.
 // ---------------------------------------------------------------------------
 contract OseroForkTest is ForkBase {
     bytes32 constant ILK    = 0x414c4c4f4341544f522d505259534d2d41000000000000000000000000000000; // ALLOCATOR-PRYSM-A
@@ -289,6 +323,10 @@ contract GroveForkTest is ForkBase {
     address constant STAC_ORACLE = 0x802CaCc19B9b3eb474C7DEf6f28c64AB67fb0753;   // Chronicle
     address constant CHRONICLE_AUTHED = 0x62a69d7832040Cd629Ee2f712b4C8639C0F905D7;
     ChroniclePip stacPip;
+    CapitalPip buidlPip;
+    int256 buidlYield;
+    Cash cash;
+    int256 cashIncome;
 
     uint256 constant PIPE_SKY   = 8339810.888358439873673301e18;
     uint256 constant PIPE_PRIME = 4913183.004893321502279642e18;
@@ -313,6 +351,9 @@ contract GroveForkTest is ForkBase {
         _fork(0);
         bloom = _new(BLOOM, ALM, SUB, 1);
         grove = _new(GROVE, DIAMOND, SUB, 0);
+        cash = new Cash(address(bloom));
+        bloom.rely(address(cash));
+        vm.makePersistent(address(cash));
         // Subsidy as the pipeline priced it for August: SOFR 3.66% ramping
         // toward BR over 24 months, T = 7 -> 3.6613% on the first $1B.
         bloom.file("cut", 0.036613e27);
@@ -333,7 +374,11 @@ contract GroveForkTest is ForkBase {
         bloom.init(STAC, address(stacPip), bloom.MTM());
         _v7540(bloom, JAAA,  JAAA_VAULT,  bloom.MTM());
         _v7540(bloom, JTRSY, JTRSY_VAULT, bloom.SDE());
-        _raw(bloom, BUIDL, bloom.SDE());          // const $1; its yield arrives as mints (flows)
+        buidlPip = new CapitalPip(BUIDL);
+        vm.makePersistent(address(buidlPip));
+        // Seed existing opening capital at par before Tally's first mark.
+        buidlPip.deal(ALM, int256(BalanceLike(BUIDL).balanceOf(ALM) * 1e12));
+        bloom.init(BUIDL, address(buidlPip), bloom.SDE());
         _raw(bloom, RLUSD, bloom.MTM());
         _raw(bloom, AUSD,  bloom.MTM());
         _raw(bloom, USDC,  bloom.MTM());
@@ -352,6 +397,56 @@ contract GroveForkTest is ForkBase {
         _raw(bloom, address(uint160(USDS) + 2), USDS, bloom.MTM(), ESCROW);
     }
 
+    // Replay the declared-capital hook after daily drip, preserving the
+    // original EoD debt/rebate sampling. Verified transfer fixture shows all
+    // dividend mints precede the two paired redemptions on these days, with
+    // no mints between their legs. Stage only BUIDL's pre-redemption balance
+    // at EoD; this is attribution replay, not actual intraday execution.
+    function _beforePoke(uint256 day) internal override {
+        uint256 outflow = day == 24 ? 50_000_000e6 : day == 31 ? 25_000_000e6 : 0;
+        int256 before = bloom.sde();
+        if (outflow > 0) {
+            uint256 closing = BalanceLike(BUIDL).balanceOf(ALM);
+            vm.mockCall(BUIDL, abi.encodeCall(BalanceLike.balanceOf, (ALM)), abi.encode(closing + outflow));
+            bloom.poke(BUIDL); // recognize dividend yield before capital leaves
+            buidlPip.deal(ALM, -int256(outflow * 1e12));
+            vm.clearMockedCalls(); // return to the actual historical EoD balance
+        }
+        bloom.poke(BUIDL); // seed post-capital shares; no second yield booking
+        buidlYield += bloom.sde() - before;
+    }
+
+    // Verified Ethereum receipts from the configured E21/E38/E42 payers.
+    // Raw cash/reinvested positions are already in NAV; sort attributes their
+    // equity arrival to prime supply income without adding a duplicate asset.
+    function _afterPoke(uint256 day) internal override {
+        if (day == 10) {
+            _cash(0x3e2e256b5f1a165f3764dfd1905749156dc7601000fe44f4904f648066a49989, 703, 222_936.27e18);
+            _cash(0x2d5b514fb59d52479712a54d7f2bfd999f9ce92fe7fc54310a5e7d9eb96dcf1c, 467, 20e18);
+            _cash(0x67b4556fab01bdb15ed20534a693f8e6cd7264094436c60fa368e1206a184f17, 1239, 474_468.89e18);
+        }
+        if (day == 26) {
+            _cash(0xbe8c60e79230555cb3b959c5934b00eaf90d479729d5017054cc7d43bb4d0065, 272, 857_964e18);
+        }
+    }
+
+    function _cash(bytes32 txid, uint256 logidx, uint256 wad) internal {
+        uint256 nav = bloom.nav();
+        int256 gain = bloom.gain();
+        int256 gap = bloom.gap();
+        uint256 owe = bloom.owe();
+        cash.note(txid, logidx, wad);
+        assertEq(bloom.nav(), nav, "cash attribution must not add an asset");
+        assertEq(bloom.gain(), gain + int256(wad));
+        assertEq(bloom.gap(), gap - int256(wad));
+        assertEq(bloom.owe(), owe, "supply income must not use gift");
+        cashIncome += int256(wad);
+        console2.log("CASH_RECEIPT");
+        console2.logBytes32(txid);
+        console2.log("cash_log_index", logidx);
+        console2.log("cash_amount", wad);
+    }
+
     // Pipeline per-venue revenue for the venues marked above (settlements/grove/2026-08).
     uint256 constant PIPE_MARKED   = 7322.92e18 + 36533.48e18 + 570646.76e18 + 469275.10e18;   // Steakhouse USDC, Steakhouse AUSD, JAAA, STAC
     int256  constant PIPE_LP       = 165.29e18 - 49708.11e18;                                    // Curve E11, Uniswap V3 E12
@@ -368,9 +463,11 @@ contract GroveForkTest is ForkBase {
         // $500 of the pipeline's sum for the same six venues. The LP legs
         // alone are -49,861 vs -49,543: the pipeline figure predates its
         // fee-collection credit (the Aug 17 collect of ~61.6k reads as a
-        // loss to both until declared with UniV3Pip.deal).
-        assertApproxEqAbs(gain, int256(PIPE_MARKED) + PIPE_LP, 500e18);
-        console2.log("LP venues: Tally %s vs pipeline -49,542.82 (cents, signed below)", uint256(-(gain - int256(PIPE_MARKED))) / 1e16);
+        // loss in the sampled replay; production collections require a pre-mark and Tally.sync).
+        assertApproxEqAbs(gain - cashIncome, int256(PIPE_MARKED) + PIPE_LP, 500e18);
+        assertEq(cashIncome, 1_555_389.16e18);
+        console2.log("CASH_INCOME", cashIncome);
+        console2.log("LP venues: Tally %s vs pipeline -49,542.82 (cents, signed below)", uint256(-(gain - cashIncome - int256(PIPE_MARKED))) / 1e16);
         // Net Base Rate: full debt at cut/BR less the SDE slice's rebate ==
         // the pipeline's utilized (debt - sde_av) at the same tiers. The 0.6%
         // residual is the sampling rule on the day BUIDL was redeemed (75M)
@@ -381,9 +478,12 @@ contract GroveForkTest is ForkBase {
         assertGe(tab - rebate, PIPE_COF);
         // JTRSY: the pipeline values escrowed shares at NAV, Tally values the
         // fulfilled part at its fixed claim (maxWithdraw): ~280 USDS apart.
-        assertApproxEqAbs(uint256(sde), PIPE_E9, 400e18);
-        // BUIDL's 2.11M is absent by construction: its yield arrives as
-        // mints, which are flows to an index-based reader.
+        assertApproxEqAbs(buidlYield, 2_112_593.75e18, 0.01e18);
+        assertApproxEqAbs(sde - buidlYield, int256(PIPE_E9), 400e18);
+        console2.log("BUIDL_YIELD", buidlYield);
+        // The pipeline drops the 1 + 1,000 USDS test legs from capital via
+        // its threshold, reducing reported revenue by 1,001 USDS. We declare
+        // all four legs (75M total) and recognize the actual dividend mints.
         // Sky share: full debt (2.79B) at cut/BR, vs the pipeline's utilized
         // (debt - 1.57B of SDE assets) at the same rates. Tally is higher.
         assertGt(tab, PIPE_SKY);

@@ -43,12 +43,21 @@ Token/cash distributions are not automatically distinguishable from deposits.
 Use `CapitalPip` with authorized, atomic capital declarations, or relay an
 explicit share/index decomposition and reconcile the equity gap. These introduce
 trust in the declaring writer. `own` changes enter the gap rather than the
-index-PnL bucket. UniV3 fee collections also require declaration through `deal`.
+index-PnL bucket. UniV3 fee collections, liquidity/range changes and reinvestment
+require a pre-operation mark and post-operation `Tally.sync(gem, reference)`.
+UniV3Pip contains only live assets; collected cash is marked separately. It
+rejects mixed-decimal pools and holders with more than 32 NFTs.
 
 Mixed depositor/allocator funding must be attributed before registration. Only
 the in-scope assets/yield belong in the pip. The ABI does not represent negative
 net asset value or a separate liability book; a position that needs these is
 not faithfully represented by blindly registering its gross token balance.
+
+Full CapitalPip exits retain the index rather than resetting earned income.
+For a zero-index total loss, mark the loss first, replace the pip with a fresh
+share series using the normal fresh `file` boundary, then declare new capital.
+Do not seed new money into written-off shares. See [the design](../DESIGN.md#rates-timing-and-flow-hooks)
+for the complete LP flow sequence and its authorized-caller trust assumption.
 
 ## Tags and registration
 
@@ -127,7 +136,14 @@ staleness per source. `RelayPip` enforces its configured `hop`; other adapters
 depend on the underlying protocol/feed and do not add a universal timestamp
 check. Chronicle read authorization is not by itself a freshness guarantee.
 
-A stale mark makes settlement revert and the keeper skip that instance. An
+A stale mark makes settlement revert and the keeper skip that instance.
+For a permanently broken pip, `halt(gem)` freezes the last mark without a read,
+blocks settlement and stops that gem's rebates. `mend(gem, pip, reference)` closes
+the conservative accrual interval and records the replacement value difference
+in unresolved gap. It does not silently recognize missing yield. Governance
+must review the difference and any missing rebate before approving corrections.
+See [the recovery procedure](../DESIGN.md#dependency-failure-and-recovery).
+Consumers of NAV must check `stops`: halted marks are stale, not live values. An
 unfunded or unset Till can carry claims; a caged configured Till or failed draw
 reverts the whole transaction. Monitor `zzz`, `owe`, `sde`, `sin`, `gap` and the
 `Settle`, `Pay`, `Gap`, `Note` events to distinguish paid, carried and unclassified
@@ -152,3 +168,9 @@ do not establish protocol-specific correctness or coverage by themselves.
 Individual adapters can be imported from `src/pips/<Name>.sol`. Existing named
 imports from `src/Pips.sol` remain supported. No delegatecall or proxy layer is
 introduced by splitting the source files.
+
+For separate Ethereum cash distributions, use the existing equity path rather
+than adding a duplicate NAV position. [Cash](../src/Cash.sol) wraps `sort` with
+transaction/log-reference deduplication; see the [Grove integration](GROVE-CROSS-CHAIN.md#cash-attribution-integration)
+for its trust, scope and correction requirements. This preserves supply-loss
+carry and keeps cash attribution separate from demand-side `gift` credits.

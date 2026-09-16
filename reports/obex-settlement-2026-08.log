@@ -1,9 +1,7 @@
-Compiling 4 files with Solc 0.8.34
-Solc 0.8.34 finished in 3.28s
-Compiler run successful!
+No files changed, compilation skipped
 
 Ran 4 tests for test/ObexSettlement.t.sol:ObexSettlementForkTest
-[PASS] test_obex_daily_settlement_ceiling() (gas: 45198963)
+[PASS] test_obex_daily_settlement_ceiling() (gas: 43027281)
 Logs:
   OBEX_SIM ceiling
   initial_debt 399995772000000000000000000
@@ -538,7 +536,7 @@ Logs:
   legacy_send 0
   OBEX_SIM_END ceiling
 
-[PASS] test_obex_daily_settlement_legacy() (gas: 44065540)
+[PASS] test_obex_daily_settlement_legacy() (gas: 41724165)
 Logs:
   OBEX_SIM legacy
   initial_debt 399995772000000000000000000
@@ -1073,7 +1071,7 @@ Logs:
   legacy_send 916736000000000000000000
   OBEX_SIM_END legacy
 
-[PASS] test_obex_daily_settlement_noted() (gas: 44155964)
+[PASS] test_obex_daily_settlement_noted() (gas: 41809006)
 Logs:
   OBEX_SIM noted
   initial_debt 399995772000000000000000000
@@ -1608,7 +1606,7 @@ Logs:
   legacy_send 916736000000000000000000
   OBEX_SIM_END noted
 
-[PASS] test_obex_daily_settlement_refresh() (gas: 46360982)
+[PASS] test_obex_daily_settlement_refresh() (gas: 43911640)
 Logs:
   OBEX_SIM refresh
   initial_debt 399995772000000000000000000
@@ -2143,6 +2141,6 @@ Logs:
   legacy_send 916736000000000000000000
   OBEX_SIM_END refresh
 
-Suite result: ok. 4 passed; 0 failed; 0 skipped; finished in 36.98s (66.36s CPU time)
+Suite result: ok. 4 passed; 0 failed; 0 skipped; finished in 20.19s (39.34s CPU time)
 
-Ran 1 test suite in 37.58s (36.98s CPU time): 4 tests passed, 0 failed, 0 skipped (4 total tests)
+Ran 1 test suite in 21.15s (20.19s CPU time): 4 tests passed, 0 failed, 0 skipped (4 total tests)

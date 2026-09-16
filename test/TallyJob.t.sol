@@ -138,6 +138,13 @@ contract TallyJobTest is Test {
         assertEq(abi.decode(args, (address)), address(t2));
     }
 
+    function test_rejects_noncontract_and_skips_broken_due_read() public {
+        vm.expectRevert("TallyJob/no-code");job.add(address(1));
+        vm.mockCallRevert(address(t1),abi.encodeWithSignature("live()"),bytes("broken-read"));
+        (bool ok, bytes memory args)=_workable();
+        assertTrue(ok);assertEq(abi.decode(args,(address)),address(t2));
+    }
+
     function test_add_remove() public {
         job.remove(address(t1));
         assertEq(job.count(), 1);

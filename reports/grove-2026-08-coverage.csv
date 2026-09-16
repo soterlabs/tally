@@ -1,0 +1,40 @@
+venue,chain,label,coverage,requirement,pipeline_prime_revenue,pipeline_sde_revenue,pipeline_value_som,pipeline_value_eom
+E1,ethereum,Aave Horizon RWA RLUSD (aToken),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0.00001654573260093500,0E-20,0.01425431258186553500,0.0142708583144664700
+E2,ethereum,Aave Horizon RWA USDC (aToken),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0E-8,0E-8,0.00000100,0.00000100
+E3,ethereum,Aave Ethereum RLUSD (aToken),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0.00087578796323476000,0E-20,0.36935808006662794300,0.37023386802986270300
+E4,ethereum,Grove x Steakhouse USDC (Morpho 4626),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,7322.924553255400376630555,0E-21,1003527.316199909361500742759,4010961.682987080664217373314
+E5,ethereum,Grove x Steakhouse USDC High Yield (Morpho 4626),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0E-18,0E-18,0,0
+E6,ethereum,Grove x Steakhouse AUSD (Morpho 4626),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,36533.48078651950774736747,0E-20,25197943.54576932611005134073,0.0283847595969762081983600
+E37,ethereum,Maple syrupUSDC (ERC-4626),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0E-14,0E-14,0,0
+E7,ethereum,Securitize Tokenized AAA CLO Fund (STAC),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,469275.100000,0.000000,102600718.700000,103069993.800000
+E8,ethereum,Janus Henderson Anemoy AAA CLO (JAAA),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,570646.7643450183186791680,0E-19,130164330.4336037730353834150,130734977.1979487913540625830
+E9,ethereum,Janus Henderson Anemoy Treasury Fund (JTRSY),Ethereum SDE marks,ERC-7540 claim valuation differs from headline NAV,0E-19,2507613.2940321578373975063,855559413.9886077906789031253,858067027.2826399485163006316
+E10,ethereum,BlackRock USD Institutional Digital Liquidity Fund (BUIDL-I),Ethereum SDE marks,CapitalPip with verified August capital-outflow declarations,0.0000,2111592.7500,716141828.0200,643254421.7700
+E11,ethereum,Curve AUSD/USDC stableswap LP,Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,165.29099734814771815091,0E-20,25001934.08299074383943870839,0
+E12,ethereum,Uniswap V3 AUSD/USDC pool (NFT positions),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,-49708.105287,-0.000000,25057232.614785,29007524.509497
+E30,ethereum,Uniswap V3 AUSD/USDC pool (NFT positions — alt holder),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
+E13,ethereum,RLUSD raw (ALM idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0E-19,0E-19,0,0
+E31,ethereum,AUSD raw (alt holder idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0E-8,0E-8,10068.97884600,10068.97884600
+E15,ethereum,USDC raw (ALM idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,-1.4E-23,-0E-24,0,999.17849800
+E32,ethereum,USDC raw (alt holder idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
+E16,ethereum,DAI raw (ALM idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0E-25,0E-25,0,0
+E17,ethereum,USDS raw / POL (ALM idle — already netted out of utilized),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0E-24,0E-24,0,0
+E18,ethereum,sUSDS raw / POL (ALM idle — Cat B 4626),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
+E19,base,"Grove x Steakhouse USDC High Yield (Base, Morpho 4626)",Remote position,Relay finalized remote shares/queues; preserve index versus capital,306958.04074468424624081746,0E-20,74985592.29829087768504121011,78292572.65257983250114002757
+E23,base,"Steakhouse Prime Instant (Base, Morpho V2)",Remote position,Relay finalized remote shares/queues; preserve index versus capital,740172.6066971651380539121,0E-19,204310140.6956611719230765830,205050313.3023583370611304951
+E20,avalanche_c,Janus Henderson Anemoy AAA CLO (JAAA-avalanche),Remote position,Relay finalized remote shares/queues; preserve index versus capital,1143058.287367016000000000,0E-18,260731201.713696999250000000,261874260.001064015250000000
+E21,avalanche_c,Galaxy Arch CLO Token (GACLO-1),Ethereum cash credited,Verified receipts attributed with Cash; Avalanche principal still absent,222936.27,0.00,27586956.3700,17907834.7900
+E22,plume,Anemoy Tokenized Apollo Diversified Credit Fund (ACRDX),Remote position,Relay finalized remote shares/queues; preserve index versus capital,133369.45379698104762790106,0E-20,32853651.73425009768553391523,20703791.96596750779042466108
+E24,ethereum,Steakhouse High Yield PYUSD (Morpho 4626),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
+E26,ethereum,PYUSD raw (ALM idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
+E27,base,USDC raw on Base (ALM idle),Remote position,Relay finalized remote shares/queues; preserve index versus capital,0,0,0,0
+E38,ethereum,Agora AUSD incentives (cash distribution to Grove Eth ALM),Ethereum cash credited,Verified August receipts attributed via Cash.sort; future classification requires review,857964.00,0.00,0,0
+E40,ethereum,USDS raw (Diamond PAU ALM idle),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0,0,0,0
+E41,ethereum,JTRSY Basin escrow — USDS pending subscription (Diamond PAU),Ethereum marks,Local adapter; LP collect and capital-flow hooks still required,0.00,0.00,1000000.00,12500000.00
+E42,ethereum,Galaxy Warehouse (off-chain facility — cash distribution to Grove Eth ALM),Ethereum cash credited,Verified August receipts attributed via Cash.sort; future classification requires review,474488.89,0.00,0,0
+E33,monad,"Uniswap V3 AUSD/USDC pool (Monad, NFT positions)",Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,0,0
+E14,ethereum,AUSD raw (ALM idle),Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,0,0
+E36,ethereum,OOB principal via 0xd94f (relay to Monad ALM EOA → AUSD acquisition),Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,50001000.00,50001000.00
+E25,monad,"Grove x Steakhouse High Yield AUSD (Monad, Morpho 4626)",Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,0,0
+E34,monad,"AUSD raw (Monad, alt holder idle)",Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,0,0
+E35,monad,"USDC raw (Monad, alt holder idle)",Display only,Excluded by Python accounting scope; not evidence of zero economic risk,excluded,excluded,152288.1272800,152288.1272800

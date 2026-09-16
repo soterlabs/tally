@@ -1,0 +1,25 @@
+name: Review checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  review:
+    name: Review gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.8.1
+      - run: python3 script/check_repo.py
+      - run: forge build --sizes
+      - run: forge test --no-match-contract Fork -vv
+      - run: python3 -m unittest discover -s test -p 'test_*.py' -v
+      - run: python3 -O -m unittest discover -s test -p 'test_*.py' -v

@@ -178,6 +178,9 @@ contract Tally {
 
     mapping (bytes32 => uint256) public notes; // consumed external-settlement references
 
+    mapping (address => uint256) public stopped; // quarantined marks; settlement blocked
+    mapping (bytes32 => uint256) public refs;    // flow/recovery references
+    uint256 public stops;
     uint256 public live;
 
     uint256 constant WAD  = 10 ** 18;
@@ -201,6 +204,9 @@ contract Tally {
     event Sort(int256 wad, uint8 to);
     event Quit(address indexed gem, address indexed dst, uint256 wad);
     event Cage();
+    event Sync(address indexed gem, bytes32 indexed ref, int256 flow);
+    event Halt(address indexed gem);
+    event Mend(address indexed gem, address pip, bytes32 indexed ref, int256 unresolved);
 
     // --- Init ---
     constructor(bytes32 ilk_, address vat_, address usds_, address susds_) {
@@ -284,6 +290,7 @@ contract Tally {
     function file(bytes32 what, address data) external auth {
         require(live == 1, "Tally/not-live");
         if (what == "alm") {
+            require(stops == 0, "Tally/stopped");
             require(block.timestamp == rho, "Tally/rho-not-updated");
             // The default holder of every gem: poke first so the open interval
             // is booked against the old holder, then re-seed every mark so the
@@ -323,6 +330,7 @@ contract Tally {
         require(live == 1, "Tally/not-live");
         Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
+        require(stopped[gem] == 0, "Tally/gem-unavailable");
         require(block.timestamp == rho && block.timestamp == g.rho, "Tally/rho-not-updated");
         if (what == "fee") {
             require(data <= WAD, "Tally/fee-too-high");
@@ -339,12 +347,71 @@ contract Tally {
         require(live == 1, "Tally/not-live");
         Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
+        require(stopped[gem] == 0, "Tally/gem-unavailable");
         require(block.timestamp == rho && block.timestamp == g.rho, "Tally/rho-not-updated");
         if      (what == "pip") g.pip = data;
         else if (what == "who") g.who = data;
         else revert("Tally/file-unrecognized-param");
         (g.pie, g.chi, g.own) = _read(gem);
         emit File(gem, what, data);
+    }
+
+    // Mark performance before an operation, then refresh after it in the same
+    // transaction. The entire value change here is a flow, not index income.
+    // Authorized callers attest that no performance was hidden in that change.
+    function sync(address gem, bytes32 ref) external auth {
+        require(live == 1, "Tally/not-live");
+        Gem storage g = gems[gem];
+        require(g.tag != 0 && stopped[gem] == 0, "Tally/gem-unavailable");
+        require(rho == block.timestamp && g.rho == block.timestamp, "Tally/rho-not-updated");
+        _ref(ref);
+        int256 delta = _seed(gem);
+        if (g.tag != IDL && g.tag != NIL) flux += delta;
+        emit Sync(gem, ref, delta);
+    }
+
+    // No dependency reads: several broken feeds can be quarantined separately.
+    // Frozen values are last-known marks, NOT current valuations. During the
+    // outage no rebate is granted for this gem and no settlement can execute.
+    function halt(address gem) external auth {
+        require(live == 1, "Tally/not-live");
+        require(gems[gem].tag != 0 && stopped[gem] == 0, "Tally/gem-unavailable");
+        stopped[gem] = 1;
+        stops++;
+        route = NIL;
+        emit File("route", uint256(NIL));
+        emit Halt(gem);
+    }
+
+    // Close the missed interval conservatively, then read the replacement.
+    // Value differences remain unresolved equity, never implicit index yield.
+    // Governance may classify them with sort after reviewing the evidence.
+    function mend(address gem, address pip, bytes32 ref) external auth {
+        require(live == 1, "Tally/not-live");
+        require(stopped[gem] == 1, "Tally/not-stopped");
+        _ref(ref);
+        drip();
+        gems[gem].pip = pip;
+        stopped[gem] = 0;
+        stops--;
+        int256 delta = _seed(gem);
+        if (gems[gem].tag != IDL && gems[gem].tag != NIL) gap += delta;
+        route = NIL;
+        emit File("route", uint256(NIL));
+        emit Mend(gem, pip, ref, delta);
+    }
+
+    function _ref(bytes32 ref) internal {
+        require(ref != bytes32(0) && refs[ref] == 0, "Tally/bad-reference");
+        refs[ref] = 1;
+    }
+
+    function _seed(address gem) internal returns (int256 delta) {
+        Gem storage g = gems[gem];
+        uint256 was = _val(g.pie, g.chi, g.own);
+        (g.pie, g.chi, g.own) = _read(gem);
+        g.rho = block.timestamp;
+        delta = int256(_val(g.pie, g.chi, g.own)) - int256(was);
     }
 
     /// @notice Classify a just-executed external settlement's debt increase.
@@ -490,6 +557,7 @@ contract Tally {
         uint256 spread = _ps(pad) * dt;
         for (uint256 k = 0; k < list.length; k++) {
             Gem storage g = gems[list[k]];
+            if (stopped[list[k]] == 1) continue;
             if (g.tag != SAV && g.tag != IDL && g.tag != SDE) continue;
             (uint256 pie, uint256 chi_, uint256 own) = _read(list[k]);
             uint256 v = _min(_val(pie, chi_, own), _val(g.pie, g.chi, g.own));
@@ -506,6 +574,7 @@ contract Tally {
 
     function _read(address gem) internal view returns (uint256 pie, uint256 chi_, uint256 own) {
         Gem storage g = gems[gem];
+        if (stopped[gem] == 1) return (g.pie, g.chi, g.own);
         address who = g.who == address(0) ? alm : g.who;
         (pie, chi_, own) = PipLike(g.pip).peek(who);
         chi_ = _wmul(chi_, WAD - g.fee);
@@ -515,6 +584,8 @@ contract Tally {
     function poke(address gem) public returns (uint256 val) {
         Gem storage g = gems[gem];
         require(g.tag != 0, "Tally/gem-not-init");
+        // A frozen read must not make the last valid mark appear fresh.
+        if (stopped[gem] == 1) return _val(g.pie, g.chi, g.own);
 
         // Rebate samples belong to drip's interval, not to an arbitrary
         // caller's mark cadence. Do not overwrite them before accruing.
@@ -576,6 +647,7 @@ contract Tally {
 
     /// @notice Run the day: accrue, mark, and execute the MSC identity in whole USDS.
     function settle() external {
+        require(stops == 0, "Tally/stopped");
         require(live == 1, "Tally/not-live");
         drip();
         poke();

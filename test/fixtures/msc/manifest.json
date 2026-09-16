@@ -1,0 +1,15 @@
+{
+  "description": "Frozen August 2026 MSC report inputs, not a rerun of the MSC process.",
+  "source_commit": "466c59ca27274caab42c118fea91baf2c2c2f8c2",
+  "source_config_sha256": "ab6badae39d7ee5e294aa14a7d5b906534d37ae84e3697e1f23134e95181f74e",
+  "config_transform": "Only venue id and chain retained from config/grove.yaml.",
+  "files": {
+    "settlements/obex/2026-08/provenance.json": "e0684e29ae36278f36e79d02a5a4cf72ea3cc76de549bb3c0356573819b38fb8",
+    "settlements/obex/2026-08/summary.md": "35e7d02ac6208393d2857305aee001b36b6cc201d8b748c5fd260d1dd3c372cf",
+    "settlements/osero/2026-08/provenance.json": "62b03b532c8bbcdf7ef74003a3638ae7c02a67b43270df5fdcb13de88b72fadf",
+    "settlements/osero/2026-08/summary.md": "143a6fd25181c973b05c08db6b246bdd303f79deb3b7a1fda93fe22f0a7ba5c1",
+    "settlements/grove/2026-08/provenance.json": "d6fb40d3c43caf3bdc7d0983b7ff071433ad056d22825b9f0f19eeb9d3af3aa9",
+    "settlements/grove/2026-08/summary.md": "ee15f0ffa0f84333eeb5b6aeadf7fd3de3174767848661afe40692ace705c14d",
+    "config/grove.yaml": "827496782a01fe057367b98b6e7e6edd6ebfb627e48f26ef61d6a9be9dc28dd5"
+  }
+}
