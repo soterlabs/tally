@@ -48,10 +48,13 @@ carries the gap for classification; automatic routing needs a complete book.
 | Tag | Index PnL | Borrowing treatment |
 |---|---|---|
 | MTM | Prime `gain` | Ordinary utilization |
-| SDE | Sky `sde` up to the cap; remainder to prime | Sky's slice reduces utilization |
+| SDE | PnL allocated proportionally to Sky's capped position-value slice; remainder to prime | Sky's slice reduces utilization |
 | SAV | Prime `gain` | Savings-token spread rebated |
 | IDL | None; memo slice excluded from NAV and flux | Reduces utilization |
 | NIL | None; included in NAV, excluded from flux | No deduction |
+
+The SDE cap is a position value in wad, not an income limit; zero means the
+whole position. PnL allocation uses the position value at the preceding mark.
 
 `sort(signedAmount, MTM/SDE)` moves gap into an income bucket. `gift(amount)` adds
 demand income to `owe`. Supply losses offset future supply gains, not demand
